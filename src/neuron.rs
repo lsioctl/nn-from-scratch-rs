@@ -10,6 +10,9 @@
 //! (and a negative weight means "this input argues against firing"). The
 //! `bias` shifts how eager the neuron is to fire at all.
 
+use crate::loss::{squared_error, squared_error_derivative};
+use crate::rng::Rng;
+
 /// The logistic "sigmoid" activation.
 ///
 /// Squashes any real number into the open range (0, 1):
@@ -21,6 +24,23 @@
 /// do. The non-linearity is what makes depth worth anything.
 pub fn sigmoid(x: f64) -> f64 {
     1.0 / (1.0 + (-x).exp())
+}
+
+/// The derivative of sigmoid — but expressed in terms of its *output*.
+///
+/// The identity is a small gift:
+///
+///     sigmoid'(z) = sigmoid(z) * (1 - sigmoid(z))
+///
+/// so if you already have `y = sigmoid(z)`, the slope is just `y * (1 - y)`.
+/// You never need to keep `z` around, and never need to call `exp` twice.
+///
+/// Look at the shape: it peaks at 0.25 when y = 0.5, and collapses toward 0
+/// as y approaches 0 or 1. That means a neuron which is *very* confident
+/// barely learns — its gradient is nearly zero. This is the "saturation"
+/// problem, and it will bite us later.
+pub fn sigmoid_derivative_from_output(y: f64) -> f64 {
+    y * (1.0 - y)
 }
 
 /// A single neuron: one weight per input, plus one bias.
@@ -63,6 +83,98 @@ impl Neuron {
     pub fn forward(&self, inputs: &[f64]) -> f64 {
         sigmoid(self.net_input(inputs))
     }
+
+    /// A neuron with random weights, ready to be trained.
+    ///
+    /// Small random values, not zeros. Zeros would be a disaster in a *layer*:
+    /// every neuron would compute the same thing, receive the same gradient,
+    /// and stay identical forever. Randomness is what lets neurons specialise.
+    pub fn random(n_inputs: usize, rng: &mut Rng) -> Self {
+        Self {
+            weights: (0..n_inputs).map(|_| rng.uniform(-1.0, 1.0)).collect(),
+            bias: rng.uniform(-1.0, 1.0),
+        }
+    }
+
+    /// How much the loss would change if each weight (and the bias) nudged up.
+    ///
+    /// This is the chain rule, applied twice. The loss depends on `y`, which
+    /// depends on `z`, which depends on each `w`:
+    ///
+    ///     dL/dw_i = dL/dy  *  dy/dz  *  dz/dw_i
+    ///             = 2(y-t) * y(1-y) *  x_i
+    ///                 |         |        |
+    ///          loss slope   sigmoid   the input that
+    ///                        slope    weight was scaling
+    ///
+    /// The bias is the same story with `dz/db = 1`, since the bias is added
+    /// rather than multiplied by anything:
+    ///
+    ///     dL/db = 2(y-t) * y(1-y)
+    ///
+    /// That shared prefix `dL/dz = 2(y-t) * y(1-y)` gets its own name:
+    /// **delta**. It means "how wrong this neuron's pre-activation was".
+    /// Remember it — in backpropagation, delta is the quantity that travels
+    /// backwards through the network.
+    ///
+    /// Returns `(weight gradients, bias gradient)`.
+    pub fn gradients(&self, inputs: &[f64], target: f64) -> (Vec<f64>, f64) {
+        let y = self.forward(inputs);
+
+        let delta = squared_error_derivative(y, target) * sigmoid_derivative_from_output(y);
+
+        // Each weight's gradient is delta scaled by the input it multiplies.
+        // A weight attached to an input of 0 gets no gradient at all — it had
+        // no influence on this prediction, so it earns no blame.
+        let weight_gradients = inputs.iter().map(|x| delta * x).collect();
+
+        (weight_gradients, delta)
+    }
+
+    /// Take one step *downhill*.
+    ///
+    /// The gradient points in the direction that *increases* the loss, so we
+    /// subtract it. `learning_rate` controls the step size: too small and
+    /// training crawls, too large and you overshoot the valley and diverge.
+    pub fn apply_gradients(&mut self, weight_gradients: &[f64], bias_gradient: f64, learning_rate: f64) {
+        for (w, g) in self.weights.iter_mut().zip(weight_gradients) {
+            *w -= learning_rate * g;
+        }
+        self.bias -= learning_rate * bias_gradient;
+    }
+
+    /// One full pass over the dataset: measure, average, step once.
+    ///
+    /// This is "batch" gradient descent — we accumulate gradients from every
+    /// example before changing anything. Averaging over the batch gives a
+    /// smoother, more trustworthy direction than reacting to one example at
+    /// a time.
+    ///
+    /// Returns the mean loss *before* this update, which is what you plot to
+    /// watch training progress.
+    pub fn train_epoch(&mut self, samples: &[(Vec<f64>, f64)], learning_rate: f64) -> f64 {
+        let mut summed_weight_gradients = vec![0.0; self.weights.len()];
+        let mut summed_bias_gradient = 0.0;
+        let mut total_loss = 0.0;
+
+        for (inputs, target) in samples {
+            total_loss += squared_error(self.forward(inputs), *target);
+
+            let (weight_gradients, bias_gradient) = self.gradients(inputs, *target);
+            for (acc, g) in summed_weight_gradients.iter_mut().zip(&weight_gradients) {
+                *acc += g;
+            }
+            summed_bias_gradient += bias_gradient;
+        }
+
+        let n = samples.len() as f64;
+        for g in &mut summed_weight_gradients {
+            *g /= n;
+        }
+        self.apply_gradients(&summed_weight_gradients, summed_bias_gradient / n, learning_rate);
+
+        total_loss / n
+    }
 }
 
 #[cfg(test)]
@@ -81,6 +193,116 @@ mod tests {
         let n = Neuron::new(vec![2.0, -3.0], 1.0);
         // 2*1 + (-3)*4 + 1 = 2 - 12 + 1 = -9
         assert_eq!(n.net_input(&[1.0, 4.0]), -9.0);
+    }
+
+    /// The single most useful test in this whole project.
+    ///
+    /// We derived `gradients` with calculus on paper. Here we check it against
+    /// the *definition* of a derivative — nudge a weight by a tiny amount and
+    /// see how much the loss actually moved:
+    ///
+    ///     dL/dw  ~=  (L(w + h) - L(w - h)) / 2h
+    ///
+    /// If the hand-derived formula disagrees with reality, this catches it.
+    /// Any time you add a new layer or activation, gradient-check it first —
+    /// a wrong gradient doesn't crash, it just quietly fails to learn.
+    #[test]
+    fn analytic_gradients_match_numerical_ones() {
+        let neuron = Neuron::new(vec![0.3, -0.8], 0.15);
+        let inputs = [0.7, 0.4];
+        let target = 1.0;
+
+        let (grad_w, grad_b) = neuron.gradients(&inputs, target);
+        let h = 1e-6;
+
+        for i in 0..neuron.weights.len() {
+            let mut up = neuron.clone();
+            up.weights[i] += h;
+            let mut down = neuron.clone();
+            down.weights[i] -= h;
+
+            let numerical = (squared_error(up.forward(&inputs), target)
+                - squared_error(down.forward(&inputs), target))
+                / (2.0 * h);
+
+            assert!(
+                (grad_w[i] - numerical).abs() < 1e-7,
+                "weight {i}: analytic {} vs numerical {numerical}",
+                grad_w[i]
+            );
+        }
+
+        let mut up = neuron.clone();
+        up.bias += h;
+        let mut down = neuron.clone();
+        down.bias -= h;
+        let numerical = (squared_error(up.forward(&inputs), target)
+            - squared_error(down.forward(&inputs), target))
+            / (2.0 * h);
+        assert!((grad_b - numerical).abs() < 1e-7);
+    }
+
+    #[test]
+    fn sigmoid_derivative_peaks_in_the_middle() {
+        // Steepest where the neuron is undecided...
+        assert_eq!(sigmoid_derivative_from_output(0.5), 0.25);
+        // ...and nearly flat where it is confident. This is saturation.
+        assert!(sigmoid_derivative_from_output(0.99) < 0.01);
+        assert!(sigmoid_derivative_from_output(0.01) < 0.01);
+    }
+
+    #[test]
+    fn gradient_descent_learns_the_and_gate() {
+        let samples = vec![
+            (vec![0.0, 0.0], 0.0),
+            (vec![0.0, 1.0], 0.0),
+            (vec![1.0, 0.0], 0.0),
+            (vec![1.0, 1.0], 1.0),
+        ];
+
+        let mut rng = Rng::new(42);
+        let mut neuron = Neuron::random(2, &mut rng);
+
+        let first_loss = neuron.train_epoch(&samples, 5.0);
+        let mut last_loss = first_loss;
+        for _ in 0..20_000 {
+            last_loss = neuron.train_epoch(&samples, 5.0);
+        }
+
+        assert!(last_loss < first_loss, "loss should go down");
+        assert!(last_loss < 0.01, "should learn AND, got loss {last_loss}");
+
+        for (inputs, target) in &samples {
+            let got = neuron.forward(inputs);
+            assert!((got - target).abs() < 0.2, "{inputs:?} -> {got}, want {target}");
+        }
+    }
+
+    /// The empirical version of the claim from step 1: one neuron is one line,
+    /// and no line solves XOR. Training does not fail with an error — it just
+    /// stalls, hedging at 0.5 for every input.
+    #[test]
+    fn gradient_descent_cannot_learn_xor() {
+        let samples = vec![
+            (vec![0.0, 0.0], 0.0),
+            (vec![0.0, 1.0], 1.0),
+            (vec![1.0, 0.0], 1.0),
+            (vec![1.0, 1.0], 0.0),
+        ];
+
+        let mut rng = Rng::new(42);
+        let mut neuron = Neuron::random(2, &mut rng);
+
+        let mut loss = 0.0;
+        for _ in 0..20_000 {
+            loss = neuron.train_epoch(&samples, 5.0);
+        }
+
+        // 0.25 is exactly the loss of giving up and answering 0.5 every time.
+        assert!(loss > 0.2, "expected it to stall near 0.25, got {loss}");
+        for (inputs, _) in &samples {
+            assert!((neuron.forward(inputs) - 0.5).abs() < 0.1);
+        }
     }
 
     #[test]
