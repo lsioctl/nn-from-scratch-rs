@@ -1,67 +1,51 @@
-//! Step 2a: a layer — several neurons side by side.
+//! A layer, as matrices.
 //!
-//! A layer is just a `Vec<Neuron>` where every neuron sees the *same* inputs
-//! and produces its own output. There is no communication between neurons
-//! within a layer; they are completely independent.
+//! The old `Layer` held `Vec<Neuron>` and looped. This one holds a single
+//! weight matrix and processes an entire batch of samples in one product.
 //!
-//!            x1 ─┬──────> [neuron 0] ──> y0
-//!                │    ┌─> [neuron 1] ──> y1
-//!            x2 ─┴────┴─> [neuron 2] ──> y2
+//! Shapes, with `B` = batch size, `I` = inputs, `O` = neurons:
 //!
-//! So if one neuron draws one line through the input space (step 1), a layer
-//! of three neurons draws three lines at once. `n` inputs go in, `n_neurons`
-//! outputs come out — and note that those two numbers need not match. A layer
-//! is free to change the width of the data flowing through it.
+//!     X  (B, I)   a batch of inputs, one sample per ROW
+//!     W  (I, O)   column j is the j-th neuron's weights
+//!     b  (O)      one bias per neuron, broadcast across the batch
+//!
+//!     Z = X * W + b     (B, O)   pre-activations
+//!     A = sigmoid(Z)    (B, O)   outputs
+//!
+//! Note `W` is stored transposed relative to how you would picture a list of
+//! neurons: a *column* of `W` is one neuron's weight vector. That is what
+//! makes `X * W` work out, and it means the inner loop of `matmul` walks a
+//! contiguous row rather than striding down a column.
 
-use crate::neuron::{Neuron, sigmoid_derivative_from_output};
+use crate::activation::{sigmoid, sigmoid_derivative_from_output};
+use crate::matrix::Matrix;
+use crate::rng::Rng;
 
 #[derive(Debug, Clone)]
 pub struct Layer {
-    pub neurons: Vec<Neuron>,
+    /// `(n_inputs, n_neurons)` — column j holds neuron j's weights.
+    pub weights: Matrix,
+    /// One per neuron.
+    pub biases: Vec<f64>,
 }
 
-/// The gradients for one layer: one gradient per weight, one per bias.
-///
-/// Same shape as the layer itself — `weights[j][i]` is the gradient for the
-/// i-th weight of the j-th neuron.
+/// Gradients for one layer, shaped exactly like the layer itself.
 #[derive(Debug, Clone)]
 pub struct LayerGradients {
-    pub weights: Vec<Vec<f64>>,
+    pub weights: Matrix,
     pub biases: Vec<f64>,
 }
 
 impl LayerGradients {
-    /// An all-zero set of gradients shaped like `layer`, ready to accumulate.
     pub fn zeros_like(layer: &Layer) -> Self {
         Self {
-            weights: layer
-                .neurons
-                .iter()
-                .map(|n| vec![0.0; n.weights.len()])
-                .collect(),
-            biases: vec![0.0; layer.neurons.len()],
+            weights: Matrix::zeros(layer.weights.rows, layer.weights.cols),
+            biases: vec![0.0; layer.biases.len()],
         }
     }
 
-    /// Add another sample's gradients into this accumulator.
-    pub fn add(&mut self, other: &LayerGradients) {
-        for (row, other_row) in self.weights.iter_mut().zip(&other.weights) {
-            for (g, o) in row.iter_mut().zip(other_row) {
-                *g += o;
-            }
-        }
-        for (b, o) in self.biases.iter_mut().zip(&other.biases) {
-            *b += o;
-        }
-    }
-
-    /// Divide through by the batch size to get an average.
     pub fn scale(&mut self, factor: f64) {
-        for row in &mut self.weights {
-            for g in row {
-                *g *= factor;
-            }
-        }
+        self.weights.scale(factor);
         for b in &mut self.biases {
             *b *= factor;
         }
@@ -69,111 +53,110 @@ impl LayerGradients {
 }
 
 impl Layer {
-    pub fn new(neurons: Vec<Neuron>) -> Self {
-        assert!(!neurons.is_empty(), "a layer needs at least one neuron");
+    pub fn new(weights: Matrix, biases: Vec<f64>) -> Self {
+        assert_eq!(
+            weights.cols,
+            biases.len(),
+            "{} neurons but {} biases",
+            weights.cols,
+            biases.len()
+        );
+        Self { weights, biases }
+    }
 
-        // Every neuron in a layer reads the same input vector, so they must
-        // all agree on how long that vector is. Catching this here gives a
-        // clear error instead of a confusing panic deep inside `forward`.
-        let width = neurons[0].weights.len();
-        assert!(
-            neurons.iter().all(|n| n.weights.len() == width),
-            "all neurons in a layer must accept the same number of inputs"
+    /// Random weights in [-1, 1).
+    ///
+    /// Not zeros: identical neurons would receive identical gradients and stay
+    /// identical forever. Randomness is what lets them specialise.
+    pub fn random(n_inputs: usize, n_neurons: usize, rng: &mut Rng) -> Self {
+        let data = (0..n_inputs * n_neurons)
+            .map(|_| rng.uniform(-1.0, 1.0))
+            .collect();
+
+        Self {
+            weights: Matrix::from_vec(n_inputs, n_neurons, data),
+            biases: (0..n_neurons).map(|_| rng.uniform(-1.0, 1.0)).collect(),
+        }
+    }
+
+    pub fn n_inputs(&self) -> usize {
+        self.weights.rows
+    }
+
+    pub fn n_outputs(&self) -> usize {
+        self.weights.cols
+    }
+
+    /// `A = sigmoid(X * W + b)` for a whole batch.
+    ///
+    /// Compare with the old version, which was a `map` over neurons, each
+    /// doing its own `zip`/`sum` over weights. Three nested loops became one
+    /// matrix product plus two elementwise passes.
+    pub fn forward(&self, inputs: &Matrix) -> Matrix {
+        assert_eq!(
+            inputs.cols,
+            self.n_inputs(),
+            "layer expects {} inputs, got {}",
+            self.n_inputs(),
+            inputs.cols
         );
 
-        Self { neurons }
+        let mut out = inputs.matmul(&self.weights);
+        out.add_row_broadcast(&self.biases);
+        out.map_in_place(sigmoid);
+        out
     }
 
-    /// How many inputs this layer expects.
-    pub fn n_inputs(&self) -> usize {
-        self.neurons[0].weights.len()
-    }
-
-    /// How many outputs this layer produces (one per neuron).
-    pub fn n_outputs(&self) -> usize {
-        self.neurons.len()
-    }
-
-    /// Run every neuron on the same inputs and collect their outputs.
+    /// The backward pass, for a whole batch.
     ///
-    /// This is the whole layer. `map` over the neurons, ask each for its
-    /// `forward`, gather the results into a `Vec`.
-    pub fn forward(&self, inputs: &[f64]) -> Vec<f64> {
-        self.neurons.iter().map(|n| n.forward(inputs)).collect()
-    }
-
-    /// The backward pass: gradients for this layer, plus the error signal to
-    /// hand to the layer behind it.
+    /// Identical in meaning to the loop-based version — only the notation
+    /// changed. Given `dL/dA` (how the loss responds to this layer's outputs):
     ///
-    /// The signature is the important idea. Every layer speaks the same
-    /// language in both directions:
+    ///     dZ = dA ⊙ sigmoid'(A)      (B, O)   through the activation
+    ///     dW = X^T * dZ              (I, O)   blame each weight
+    ///     db = column sums of dZ     (O)      the bias saw every sample
+    ///     dX = dZ * W^T              (B, I)   blame each input
     ///
-    ///   forward:   inputs           ──>  outputs
-    ///   backward:  dL/d(outputs)    ──>  dL/d(inputs)
+    /// The two transposes are the whole trick, and they are not arbitrary.
+    /// Forward, `X * W` contracts over inputs. Going backward you need to
+    /// contract over the *other* index each time, and transposing is how you
+    /// say that. A useful sanity check when deriving these: only one
+    /// arrangement of each product has shapes that line up at all.
     ///
-    /// A layer is handed "how much the loss cares about each of my outputs",
-    /// and returns "how much the loss cares about each of my inputs". Since
-    /// its inputs *are* the previous layer's outputs, that return value is
-    /// exactly what the previous layer needs. Chain the layers and the signal
-    /// walks all the way back to the front. That is backpropagation.
-    ///
-    /// Three things happen per neuron:
-    ///
-    ///   1. delta = dL/dout * sigmoid'(out)     -- push through the activation
-    ///   2. weight gradient = delta * input     -- blame each weight in
-    ///      bias gradient   = delta                proportion to what it saw
-    ///   3. send delta * weight backwards       -- blame each input in
-    ///                                             proportion to its weight
-    ///
-    /// Step 3 is the answer to "what should the hidden neuron have output?"
-    /// We never find out. Instead we ask: *if* this input had been slightly
-    /// larger, would the loss have gone up or down? A hidden neuron connected
-    /// through a large weight gets a large share of the blame. It is a
-    /// responsibility calculation, and it needs no target.
+    /// `dX` is what the previous layer receives as *its* `dA`. Same contract
+    /// as before — `dL/d(outputs)` in, `dL/d(inputs)` out.
     pub fn backward(
         &self,
-        inputs: &[f64],
-        outputs: &[f64],
-        dl_doutputs: &[f64],
-    ) -> (LayerGradients, Vec<f64>) {
-        let mut gradients = LayerGradients::zeros_like(self);
+        inputs: &Matrix,
+        outputs: &Matrix,
+        d_outputs: &Matrix,
+    ) -> (LayerGradients, Matrix) {
+        // dZ = dA ⊙ sigmoid'(A)
+        let mut d_z = d_outputs.clone();
+        let mut slopes = outputs.clone();
+        slopes.map_in_place(sigmoid_derivative_from_output);
+        d_z.multiply_elementwise(&slopes);
 
-        // What we will hand back to the previous layer. Every neuron in this
-        // layer contributes to every one of these, so we sum into it.
-        let mut dl_dinputs = vec![0.0; self.n_inputs()];
+        let d_weights = inputs.transpose().matmul(&d_z);
+        let d_biases = d_z.column_sums();
+        let d_inputs = d_z.matmul(&self.weights.transpose());
 
-        for (j, neuron) in self.neurons.iter().enumerate() {
-            // 1. Convert "gradient w.r.t. my output" into "gradient w.r.t. my
-            //    pre-activation z" by passing through the sigmoid's slope.
-            //    This is the same `delta` from step 3a.
-            let delta = dl_doutputs[j] * sigmoid_derivative_from_output(outputs[j]);
-
-            // 2. This layer's own gradients — identical to the single-neuron
-            //    case, because once you have delta, nothing else differs.
-            for (i, g) in gradients.weights[j].iter_mut().enumerate() {
-                *g = delta * inputs[i];
-            }
-            gradients.biases[j] = delta;
-
-            // 3. Propagate. Input i influenced this neuron through weight i,
-            //    so it receives delta * weight_i of the blame — accumulated
-            //    across every neuron this input fed into.
-            for (i, w) in neuron.weights.iter().enumerate() {
-                dl_dinputs[i] += delta * w;
-            }
-        }
-
-        (gradients, dl_dinputs)
+        (
+            LayerGradients {
+                weights: d_weights,
+                biases: d_biases,
+            },
+            d_inputs,
+        )
     }
 
     /// Step every weight and bias downhill.
     pub fn apply_gradients(&mut self, gradients: &LayerGradients, learning_rate: f64) {
-        for (neuron, (weight_grads, bias_grad)) in self
-            .neurons
-            .iter_mut()
-            .zip(gradients.weights.iter().zip(&gradients.biases))
-        {
-            neuron.apply_gradients(weight_grads, *bias_grad, learning_rate);
+        for (w, g) in self.weights.data.iter_mut().zip(&gradients.weights.data) {
+            *w -= learning_rate * g;
+        }
+        for (b, g) in self.biases.iter_mut().zip(&gradients.biases) {
+            *b -= learning_rate * g;
         }
     }
 }
@@ -181,45 +164,92 @@ impl Layer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neuron::Neuron;
 
-    /// A layer holding the AND and OR gates from step 1.
-    fn and_or_layer() -> Layer {
-        Layer::new(vec![
-            Neuron::new(vec![10.0, 10.0], -15.0), // AND
-            Neuron::new(vec![10.0, 10.0], -5.0),  // OR
-        ])
-    }
-
+    /// The refactor must not change what the network computes.
+    ///
+    /// `neuron.rs` still holds the original one-neuron-at-a-time
+    /// implementation. Here we build the same layer both ways and demand
+    /// identical outputs. This is the test that makes the rewrite safe —
+    /// the old code earns its keep as an executable specification.
     #[test]
-    fn layer_maps_inputs_to_one_output_per_neuron() {
-        let layer = and_or_layer();
-        assert_eq!(layer.n_inputs(), 2);
-        assert_eq!(layer.n_outputs(), 2);
+    fn matrix_layer_agrees_with_the_neuron_implementation() {
+        // Two neurons, three inputs each.
+        let neurons = vec![
+            Neuron::new(vec![0.5, -1.2, 0.3], 0.1),
+            Neuron::new(vec![-0.7, 0.4, 2.0], -0.6),
+        ];
 
-        let out = layer.forward(&[1.0, 0.0]);
-        assert_eq!(out.len(), 2);
-        assert!(out[0] < 0.01, "AND should be quiet for (1, 0)");
-        assert!(out[1] > 0.99, "OR should fire for (1, 0)");
-    }
+        // Same thing as a matrix: column j is neuron j's weights, so the
+        // matrix is the transpose of the list-of-neurons view.
+        let layer = Layer::new(
+            Matrix::from_rows(&[
+                vec![0.5, -0.7], // input 0 -> both neurons
+                vec![-1.2, 0.4], // input 1 -> both neurons
+                vec![0.3, 2.0],  // input 2 -> both neurons
+            ]),
+            vec![0.1, -0.6],
+        );
 
-    #[test]
-    fn a_layer_may_change_the_width_of_the_data() {
-        // 2 inputs in, 3 outputs out.
-        let layer = Layer::new(vec![
-            Neuron::new(vec![1.0, 0.0], 0.0),
-            Neuron::new(vec![0.0, 1.0], 0.0),
-            Neuron::new(vec![1.0, 1.0], 0.0),
+        let batch = Matrix::from_rows(&[
+            vec![1.0, 0.5, -0.3],
+            vec![0.0, 2.0, 1.0],
+            vec![-1.0, -1.0, 0.25],
         ]);
-        assert_eq!(layer.n_inputs(), 2);
-        assert_eq!(layer.forward(&[1.0, 1.0]).len(), 3);
+
+        let got = layer.forward(&batch);
+
+        for r in 0..batch.rows {
+            for (j, neuron) in neurons.iter().enumerate() {
+                let expected = neuron.forward(batch.row(r));
+                assert!(
+                    (got.get(r, j) - expected).abs() < 1e-12,
+                    "sample {r} neuron {j}: matrix {} vs neuron {expected}",
+                    got.get(r, j)
+                );
+            }
+        }
     }
 
     #[test]
-    #[should_panic(expected = "same number of inputs")]
-    fn neurons_must_agree_on_input_width() {
-        Layer::new(vec![
-            Neuron::new(vec![1.0, 2.0], 0.0),
-            Neuron::new(vec![1.0], 0.0),
-        ]);
+    fn forward_produces_one_row_per_sample() {
+        let mut rng = Rng::new(1);
+        let layer = Layer::random(4, 3, &mut rng);
+
+        let batch = Matrix::zeros(7, 4);
+        let out = layer.forward(&batch);
+
+        assert_eq!(out.rows, 7, "one row per sample");
+        assert_eq!(out.cols, 3, "one column per neuron");
+        // sigmoid(0 + bias) for every row, so all rows are identical here.
+        assert_eq!(out.row(0), out.row(6));
+    }
+
+    #[test]
+    fn backward_shapes_line_up() {
+        let mut rng = Rng::new(2);
+        let layer = Layer::random(5, 3, &mut rng);
+
+        // `vec![..; 4]` rather than `[..; 4]`: array repetition needs Copy,
+        // and Vec is only Clone.
+        let inputs = Matrix::from_rows(&vec![vec![0.1, 0.2, 0.3, 0.4, 0.5]; 4]);
+        let outputs = layer.forward(&inputs);
+        let d_outputs = Matrix::from_rows(&vec![vec![1.0, -1.0, 0.5]; 4]);
+
+        let (gradients, d_inputs) = layer.backward(&inputs, &outputs, &d_outputs);
+
+        assert_eq!(gradients.weights.rows, 5, "one gradient row per input");
+        assert_eq!(gradients.weights.cols, 3, "one gradient column per neuron");
+        assert_eq!(gradients.biases.len(), 3);
+        assert_eq!(d_inputs.rows, 4, "one row per sample");
+        assert_eq!(d_inputs.cols, 5, "one column per input");
+    }
+
+    #[test]
+    #[should_panic(expected = "layer expects 4 inputs, got 3")]
+    fn wrong_input_width_is_rejected() {
+        let mut rng = Rng::new(3);
+        let layer = Layer::random(4, 2, &mut rng);
+        layer.forward(&Matrix::zeros(1, 3));
     }
 }

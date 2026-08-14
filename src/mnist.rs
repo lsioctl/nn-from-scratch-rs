@@ -20,6 +20,8 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+use crate::matrix::Matrix;
+
 /// A dataset of images and their digit labels.
 pub struct MnistData {
     /// One entry per image: 784 pixels, each already scaled to [0, 1].
@@ -55,6 +57,23 @@ impl MnistData {
                 (image.clone(), target)
             })
             .collect()
+    }
+
+    /// The whole split as two matrices: `(N, 784)` inputs and `(N, 10)`
+    /// one-hot targets.
+    ///
+    /// This is what the matrix network trains on. Flattening the dataset once,
+    /// up front, means training never has to touch a `Vec<Vec<f64>>` again —
+    /// batches are cut straight out of these with `select_rows`.
+    pub fn to_matrices(&self) -> (Matrix, Matrix) {
+        let inputs = Matrix::from_vec(self.len(), 784, self.images.concat());
+
+        let mut targets = Matrix::zeros(self.len(), 10);
+        for (row, &label) in self.labels.iter().enumerate() {
+            targets.set(row, label as usize, 1.0);
+        }
+
+        (inputs, targets)
     }
 }
 
@@ -264,6 +283,24 @@ mod tests {
 
     /// Every digit should appear a few thousand times; a parsing slip that
     /// shifted the label stream would show up as a wildly skewed histogram.
+    #[test]
+    fn matrices_have_the_right_shape_and_agree_with_to_samples() {
+        let Some(data) = training_or_skip() else { return };
+
+        let (inputs, targets) = data.to_matrices();
+        assert_eq!(inputs.rows, 60_000);
+        assert_eq!(inputs.cols, 784);
+        assert_eq!(targets.rows, 60_000);
+        assert_eq!(targets.cols, 10);
+
+        // Every target row is one-hot.
+        for r in [0, 1, 12_345, 59_999] {
+            assert_eq!(targets.row(r).iter().sum::<f64>(), 1.0);
+            assert_eq!(targets.get(r, data.labels[r] as usize), 1.0);
+            assert_eq!(inputs.row(r), data.images[r].as_slice());
+        }
+    }
+
     #[test]
     fn all_ten_digits_are_present_in_sane_proportions() {
         let Some(data) = training_or_skip() else { return };

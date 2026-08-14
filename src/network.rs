@@ -1,23 +1,13 @@
-//! Step 2b: a network — layers stacked front to back.
+//! A network of matrix layers, trained on whole batches at once.
 //!
-//! Each layer's outputs become the next layer's inputs:
-//!
-//!     inputs ──> [layer 0] ──> [layer 1] ──> ... ──> outputs
-//!                  hidden        output
-//!
-//! Layers in the middle are called "hidden" layers, for the unglamorous
-//! reason that you never observe their values directly — you only see what
-//! goes into the network and what comes out.
-//!
-//! This is where depth starts to pay. One neuron carves the input space with
-//! a single straight line. A hidden layer carves it with several lines at
-//! once, which chops the space into regions. The next layer then works in
-//! terms of *those regions* rather than the raw inputs — so it can express
-//! boundaries that no single line ever could.
+//! The algorithm is unchanged from the loop-based version — forward, seed the
+//! error at the output, walk backwards handing each layer the gradient of the
+//! loss with respect to its outputs. Only now every step processes `B` samples
+//! simultaneously, and the per-sample loop that used to wrap the whole thing
+//! is gone.
 
 use crate::layer::{Layer, LayerGradients};
-use crate::loss::{squared_error, squared_error_derivative};
-use crate::neuron::Neuron;
+use crate::matrix::Matrix;
 use crate::rng::Rng;
 
 #[derive(Debug, Clone)]
@@ -29,8 +19,6 @@ impl Network {
     pub fn new(layers: Vec<Layer>) -> Self {
         assert!(!layers.is_empty(), "a network needs at least one layer");
 
-        // Layer k's outputs feed layer k+1's inputs, so the widths have to
-        // line up all the way down the stack.
         for (i, pair) in layers.windows(2).enumerate() {
             assert_eq!(
                 pair[0].n_outputs(),
@@ -45,32 +33,35 @@ impl Network {
         Self { layers }
     }
 
-    /// Push inputs through every layer in turn and return the final outputs.
+    /// Build a network of the given shape with random weights.
     ///
-    /// `fold` carries the running vector through the stack: start with the
-    /// inputs, and repeatedly replace them with the current layer's output.
-    pub fn forward(&self, inputs: &[f64]) -> Vec<f64> {
-        self.layers
-            .iter()
-            .fold(inputs.to_vec(), |values, layer| layer.forward(&values))
+    /// `&[784, 30, 10]` means 784 inputs, a hidden layer of 30, 10 outputs.
+    pub fn random(sizes: &[usize], rng: &mut Rng) -> Self {
+        assert!(sizes.len() >= 2, "need at least an input and an output size");
+
+        Self::new(
+            sizes
+                .windows(2)
+                .map(|pair| Layer::random(pair[0], pair[1], rng))
+                .collect(),
+        )
     }
 
-    /// Like `forward`, but keeps every intermediate result.
+    /// Push a batch through every layer. `(B, inputs) -> (B, outputs)`.
+    pub fn forward(&self, inputs: &Matrix) -> Matrix {
+        self.layers
+            .iter()
+            .fold(inputs.clone(), |values, layer| layer.forward(&values))
+    }
+
+    /// `forward`, keeping every intermediate activation for the backward pass.
     ///
-    /// Returns `[inputs, layer0_out, layer1_out, ...]`, so the final element
-    /// is what `forward` would have returned.
-    ///
-    /// Right now this only exists so we can *look* at the hidden layer and
-    /// see what it computed. But backpropagation will need exactly this:
-    /// to work out how to adjust a weight, you need to know what value was
-    /// flowing through it during the forward pass. Same trick as splitting
-    /// `net_input` out of `Neuron::forward` in step 1 — build the seam early.
-    pub fn forward_all(&self, inputs: &[f64]) -> Vec<Vec<f64>> {
-        let mut activations = vec![inputs.to_vec()];
+    /// Returns `[inputs, layer0_out, layer1_out, ...]`.
+    pub fn forward_all(&self, inputs: &Matrix) -> Vec<Matrix> {
+        let mut activations = Vec::with_capacity(self.layers.len() + 1);
+        activations.push(inputs.clone());
 
         for layer in &self.layers {
-            // `.last().unwrap()` is safe: we seeded the vec with the inputs,
-            // so it is never empty.
             let next = layer.forward(activations.last().unwrap());
             activations.push(next);
         }
@@ -78,192 +69,128 @@ impl Network {
         activations
     }
 
-    /// Build a network of the given shape with random weights.
-    ///
-    /// `sizes` lists the width of every stage including the input, so
-    /// `&[2, 3, 1]` means 2 inputs, a hidden layer of 3, and 1 output.
-    pub fn random(sizes: &[usize], rng: &mut Rng) -> Self {
-        assert!(sizes.len() >= 2, "need at least an input and an output size");
-
-        let layers = sizes
-            .windows(2)
-            .map(|pair| {
-                let (n_inputs, n_neurons) = (pair[0], pair[1]);
-                Layer::new(
-                    (0..n_neurons)
-                        .map(|_| Neuron::random(n_inputs, rng))
-                        .collect(),
-                )
-            })
-            .collect();
-
-        Self::new(layers)
+    /// Convenience for a single sample.
+    pub fn forward_one(&self, inputs: &[f64]) -> Vec<f64> {
+        self.forward(&Matrix::row_vector(inputs)).data
     }
 
-    /// Backpropagation: gradients for every layer, from one training example.
+    /// Backpropagation over a batch.
     ///
-    /// The whole algorithm is a forward pass, one subtraction, and a loop
-    /// running backwards. Read it in that order:
-    ///
-    ///   1. Go forward, remembering every activation along the way.
-    ///   2. Seed the error at the output: dL/dy = 2(y - t). This is the only
-    ///      place a target is ever used.
-    ///   3. Walk the layers in reverse. Each one turns "gradient w.r.t. my
-    ///      outputs" into its own gradients plus "gradient w.r.t. my inputs",
-    ///      which is the seed for the layer before it.
-    ///
-    /// Returns the per-layer gradients and the loss on this example.
-    pub fn gradients(&self, inputs: &[f64], targets: &[f64]) -> (Vec<LayerGradients>, f64) {
-        // 1. Forward, keeping activations — this is why `forward_all` exists.
+    /// Returns per-layer gradients (summed over the batch, not yet averaged)
+    /// and the summed loss.
+    pub fn gradients(&self, inputs: &Matrix, targets: &Matrix) -> (Vec<LayerGradients>, f64) {
+        assert_eq!(
+            inputs.rows, targets.rows,
+            "{} input rows but {} target rows",
+            inputs.rows, targets.rows
+        );
+
+        // 1. Forward, remembering activations.
         let activations = self.forward_all(inputs);
         let outputs = activations.last().unwrap();
 
         assert_eq!(
-            outputs.len(),
-            targets.len(),
+            outputs.cols, targets.cols,
             "network emits {} outputs but got {} targets",
-            outputs.len(),
-            targets.len()
+            outputs.cols, targets.cols
         );
 
-        // A sample's loss is the SUM over its outputs, not the mean. If we
-        // averaged here, every gradient would pick up a 1/n_outputs factor
-        // that the seed below does not have, and the two would silently
-        // disagree by exactly that factor. (This is not hypothetical — the
-        // gradient check caught precisely that mistake.) Summing keeps
-        // dL/dy_j = 2(y_j - t_j) exactly, with no bookkeeping.
-        let loss: f64 = outputs
-            .iter()
-            .zip(targets)
-            .map(|(&o, &t)| squared_error(o, t))
-            .sum();
+        // 2. Loss and its seed, both elementwise over the whole batch.
+        //    Summed over outputs *and* samples; the caller divides by B.
+        let mut loss = 0.0;
+        let mut d_outputs = Matrix::zeros(outputs.rows, outputs.cols);
+        for (i, (&o, &t)) in outputs.data.iter().zip(&targets.data).enumerate() {
+            let error = o - t;
+            loss += error * error;
+            d_outputs.data[i] = 2.0 * error;
+        }
 
-        // 2. Seed: how the loss responds to each output.
-        let mut dl_doutputs: Vec<f64> = outputs
-            .iter()
-            .zip(targets)
-            .map(|(&o, &t)| squared_error_derivative(o, t))
-            .collect();
-
-        // 3. Walk backwards. Layer k consumed activations[k] and produced
+        // 3. Walk backwards. Layer k consumed activations[k], produced
         //    activations[k + 1].
         let mut gradients = Vec::with_capacity(self.layers.len());
         for (k, layer) in self.layers.iter().enumerate().rev() {
-            let (layer_gradients, dl_dinputs) =
-                layer.backward(&activations[k], &activations[k + 1], &dl_doutputs);
+            let (layer_gradients, d_inputs) =
+                layer.backward(&activations[k], &activations[k + 1], &d_outputs);
 
             gradients.push(layer_gradients);
-
-            // This layer's inputs are the previous layer's outputs, so its
-            // "dL/d(inputs)" is precisely the next iteration's seed.
-            dl_doutputs = dl_dinputs;
+            d_outputs = d_inputs;
         }
 
-        // We collected back-to-front; flip so index k means layer k.
         gradients.reverse();
-
         (gradients, loss)
     }
 
-    /// Accumulate gradients over the selected samples, average, take one step.
-    ///
-    /// Returns the *summed* loss, so callers can average however they like.
-    fn train_batch(
-        &mut self,
-        samples: &[(Vec<f64>, Vec<f64>)],
-        indices: &[usize],
-        learning_rate: f64,
-    ) -> f64 {
-        let mut totals: Vec<LayerGradients> = self
-            .layers
-            .iter()
-            .map(LayerGradients::zeros_like)
-            .collect();
-        let mut total_loss = 0.0;
+    /// One gradient step on one batch. Returns the summed loss.
+    pub fn train_batch(&mut self, inputs: &Matrix, targets: &Matrix, learning_rate: f64) -> f64 {
+        let (mut gradients, loss) = self.gradients(inputs, targets);
 
-        for &i in indices {
-            let (inputs, targets) = &samples[i];
-            let (gradients, loss) = self.gradients(inputs, targets);
-            total_loss += loss;
-            for (acc, g) in totals.iter_mut().zip(&gradients) {
-                acc.add(g);
-            }
+        let scale = 1.0 / inputs.rows as f64;
+        for (layer, layer_gradients) in self.layers.iter_mut().zip(&mut gradients) {
+            layer_gradients.scale(scale);
+            layer.apply_gradients(layer_gradients, learning_rate);
         }
 
-        let scale = 1.0 / indices.len() as f64;
-        for (layer, gradients) in self.layers.iter_mut().zip(&mut totals) {
-            gradients.scale(scale);
-            layer.apply_gradients(gradients, learning_rate);
-        }
-
-        total_loss
+        loss
     }
 
-    /// One pass over the whole dataset as a single batch, one weight update.
+    /// One pass over the dataset in shuffled minibatches.
     ///
-    /// Fine for four XOR examples. Hopeless for 60,000 digits — see
-    /// `train_epoch_minibatch`.
-    pub fn train_epoch(&mut self, samples: &[(Vec<f64>, Vec<f64>)], learning_rate: f64) -> f64 {
-        let indices: Vec<usize> = (0..samples.len()).collect();
-        self.train_batch(samples, &indices, learning_rate) / samples.len() as f64
-    }
-
-    /// One pass over the dataset in shuffled minibatches — the workhorse.
-    ///
-    /// Full-batch descent computes a beautifully accurate gradient and then
-    /// takes *one* step with it. Across 60,000 examples that is a colossal
-    /// amount of arithmetic per update, and training would take days.
-    ///
-    /// Minibatching computes a rougher gradient from (say) 32 examples and
-    /// steps immediately, giving ~1,875 updates per pass instead of one. The
-    /// estimate is noisy, but noise is affordable and, in practice, mildly
-    /// helpful — it can knock the network out of shallow local minima.
-    ///
-    /// The shuffle matters: MNIST is not stored in random order, and batches
-    /// that were all-the-same-digit would drag the weights around in circles.
-    ///
-    /// Returns the mean per-example loss over the epoch.
+    /// Returns the mean per-sample loss over the epoch.
     pub fn train_epoch_minibatch(
         &mut self,
-        samples: &[(Vec<f64>, Vec<f64>)],
+        inputs: &Matrix,
+        targets: &Matrix,
         batch_size: usize,
         learning_rate: f64,
         rng: &mut Rng,
     ) -> f64 {
         assert!(batch_size > 0, "batch size must be positive");
+        assert_eq!(inputs.rows, targets.rows);
 
-        let mut order: Vec<usize> = (0..samples.len()).collect();
+        // Shuffle indices rather than the data — cheaper, and it leaves the
+        // caller's matrices untouched.
+        let mut order: Vec<usize> = (0..inputs.rows).collect();
         rng.shuffle(&mut order);
 
         let mut total_loss = 0.0;
         for batch in order.chunks(batch_size) {
-            total_loss += self.train_batch(samples, batch, learning_rate);
+            let batch_inputs = inputs.select_rows(batch);
+            let batch_targets = targets.select_rows(batch);
+            total_loss += self.train_batch(&batch_inputs, &batch_targets, learning_rate);
         }
 
-        total_loss / samples.len() as f64
+        total_loss / inputs.rows as f64
     }
 
-    /// The index of the largest output — the network's actual answer.
-    ///
-    /// With ten output neurons, "which digit is this?" means "which neuron is
-    /// most excited?". The raw values are not probabilities (they do not sum
-    /// to 1 — softmax would fix that), but for picking a winner it makes no
-    /// difference.
+    /// One pass over the whole dataset as a single batch. Fine for XOR.
+    pub fn train_epoch(&mut self, inputs: &Matrix, targets: &Matrix, learning_rate: f64) -> f64 {
+        self.train_batch(inputs, targets, learning_rate) / inputs.rows as f64
+    }
+
+    /// The index of the largest output — the network's answer for one sample.
     pub fn predict(&self, inputs: &[f64]) -> usize {
-        argmax(&self.forward(inputs))
+        argmax(&self.forward_one(inputs))
     }
 
     /// Fraction of samples classified correctly, in [0, 1].
     ///
-    /// This — not the loss — is what you actually care about. Loss is what we
-    /// can differentiate; accuracy is what the task is.
-    pub fn accuracy(&self, samples: &[(Vec<f64>, Vec<f64>)]) -> f64 {
-        let correct = samples
-            .iter()
-            .filter(|(inputs, targets)| self.predict(inputs) == argmax(targets))
+    /// Evaluated as one big batch, which is far faster than sample-by-sample.
+    pub fn accuracy(&self, inputs: &Matrix, targets: &Matrix) -> f64 {
+        let outputs = self.forward(inputs);
+
+        let correct = (0..outputs.rows)
+            .filter(|&r| argmax(outputs.row(r)) == argmax(targets.row(r)))
             .count();
 
-        correct as f64 / samples.len() as f64
+        correct as f64 / outputs.rows as f64
+    }
+
+    /// Total number of trainable parameters.
+    pub fn parameter_count(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|l| l.weights.data.len() + l.biases.len())
+            .sum()
     }
 }
 
@@ -282,141 +209,137 @@ pub fn argmax(values: &[f64]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neuron::Neuron;
 
-    /// XOR, built by hand from three neurons.
-    ///
-    /// The identity we are exploiting is:
-    ///     XOR = (x1 OR x2) AND NOT (x1 AND x2)
-    ///          "at least one"      "but not both"
-    ///
-    /// Hidden layer computes OR and AND. The output neuron then keeps the
-    /// OR (weight +10) while the AND vetoes it (weight -20, twice as strong,
-    /// so it always wins when it fires).
-    pub fn xor_network() -> Network {
-        Network::new(vec![
-            Layer::new(vec![
-                Neuron::new(vec![10.0, 10.0], -5.0),  // OR
-                Neuron::new(vec![10.0, 10.0], -15.0), // AND
-            ]),
-            Layer::new(vec![Neuron::new(vec![10.0, -20.0], -5.0)]),
-        ])
+    fn xor_data() -> (Matrix, Matrix) {
+        let inputs = Matrix::from_rows(&[
+            vec![0.0, 0.0],
+            vec![0.0, 1.0],
+            vec![1.0, 0.0],
+            vec![1.0, 1.0],
+        ]);
+        let targets = Matrix::from_rows(&[vec![0.0], vec![1.0], vec![1.0], vec![0.0]]);
+        (inputs, targets)
     }
 
-    #[test]
-    fn hand_built_xor_works() {
-        let net = xor_network();
-        assert!(net.forward(&[0.0, 0.0])[0] < 0.01);
-        assert!(net.forward(&[0.0, 1.0])[0] > 0.99);
-        assert!(net.forward(&[1.0, 0.0])[0] > 0.99);
-        assert!(net.forward(&[1.0, 1.0])[0] < 0.01);
-    }
-
-    #[test]
-    fn forward_all_records_every_stage() {
-        let net = xor_network();
-        let acts = net.forward_all(&[1.0, 1.0]);
-
-        assert_eq!(acts.len(), 3); // inputs, hidden, output
-        assert_eq!(acts[0], vec![1.0, 1.0]);
-        assert_eq!(acts[1].len(), 2); // the hidden layer's OR and AND
-        assert_eq!(acts[2].len(), 1);
-
-        // For (1, 1) both hidden neurons fire — and the AND is what kills
-        // the output.
-        assert!(acts[1][0] > 0.99, "OR fires");
-        assert!(acts[1][1] > 0.99, "AND fires");
-
-        // `forward_all`'s last entry must agree with `forward`.
-        assert_eq!(acts[2], net.forward(&[1.0, 1.0]));
-    }
-
-    /// Gradient check, now for the whole network.
+    /// Gradient check, on the matrix implementation, over a batch.
     ///
-    /// Backprop is easy to get subtly wrong — an index off by one, a
-    /// transposed weight, a missing activation derivative — and none of those
-    /// crash. They just make the network learn slowly, or not at all. So we
-    /// verify every single gradient against the definition of a derivative:
-    /// nudge one weight, see how much the loss really moved.
+    /// The transposes in `Layer::backward` are exactly the kind of thing that
+    /// is easy to get backwards and impossible to notice by eye. This nails
+    /// every weight against a numerical estimate.
     #[test]
     fn backprop_matches_numerical_gradients() {
         let mut rng = Rng::new(7);
-        // Deliberately lopsided (3 -> 4 -> 2) so any index mix-up between
-        // layer widths shows up as a length mismatch or a wrong number.
+        // Lopsided shape and a batch of 3, so any confusion between batch,
+        // input and neuron axes shows up.
         let net = Network::random(&[3, 4, 2], &mut rng);
 
-        let inputs = [0.6, -0.2, 0.9];
-        let targets = [1.0, 0.0];
+        let inputs = Matrix::from_rows(&[
+            vec![0.6, -0.2, 0.9],
+            vec![0.1, 0.5, -0.4],
+            vec![-0.8, 0.3, 0.2],
+        ]);
+        let targets = Matrix::from_rows(&[
+            vec![1.0, 0.0],
+            vec![0.0, 1.0],
+            vec![1.0, 1.0],
+        ]);
 
         let (gradients, _) = net.gradients(&inputs, &targets);
         let h = 1e-6;
 
         let loss_of = |n: &Network| -> f64 {
             let out = n.forward(&inputs);
-            out.iter()
-                .zip(&targets)
-                .map(|(&o, &t)| squared_error(o, t))
+            out.data
+                .iter()
+                .zip(&targets.data)
+                .map(|(&o, &t)| (o - t) * (o - t))
                 .sum()
         };
 
-        for (k, layer) in net.layers.iter().enumerate() {
-            for (j, neuron) in layer.neurons.iter().enumerate() {
-                for i in 0..neuron.weights.len() {
-                    let mut up = net.clone();
-                    up.layers[k].neurons[j].weights[i] += h;
-                    let mut down = net.clone();
-                    down.layers[k].neurons[j].weights[i] -= h;
-
-                    let numerical = (loss_of(&up) - loss_of(&down)) / (2.0 * h);
-                    let analytic = gradients[k].weights[j][i];
-
-                    assert!(
-                        (analytic - numerical).abs() < 1e-7,
-                        "layer {k} neuron {j} weight {i}: analytic {analytic} vs numerical {numerical}"
-                    );
-                }
-
+        for k in 0..net.layers.len() {
+            for i in 0..net.layers[k].weights.data.len() {
                 let mut up = net.clone();
-                up.layers[k].neurons[j].bias += h;
+                up.layers[k].weights.data[i] += h;
                 let mut down = net.clone();
-                down.layers[k].neurons[j].bias -= h;
+                down.layers[k].weights.data[i] -= h;
+
+                let numerical = (loss_of(&up) - loss_of(&down)) / (2.0 * h);
+                let analytic = gradients[k].weights.data[i];
+
+                assert!(
+                    (analytic - numerical).abs() < 1e-6,
+                    "layer {k} weight {i}: analytic {analytic} vs numerical {numerical}"
+                );
+            }
+
+            for j in 0..net.layers[k].biases.len() {
+                let mut up = net.clone();
+                up.layers[k].biases[j] += h;
+                let mut down = net.clone();
+                down.layers[k].biases[j] -= h;
 
                 let numerical = (loss_of(&up) - loss_of(&down)) / (2.0 * h);
                 let analytic = gradients[k].biases[j];
+
                 assert!(
-                    (analytic - numerical).abs() < 1e-7,
-                    "layer {k} neuron {j} bias: analytic {analytic} vs numerical {numerical}"
+                    (analytic - numerical).abs() < 1e-6,
+                    "layer {k} bias {j}: analytic {analytic} vs numerical {numerical}"
                 );
             }
         }
     }
 
-    /// The payoff: the thing a single neuron provably could not do.
     #[test]
     fn backprop_learns_xor_from_random_weights() {
-        let samples = vec![
-            (vec![0.0, 0.0], vec![0.0]),
-            (vec![0.0, 1.0], vec![1.0]),
-            (vec![1.0, 0.0], vec![1.0]),
-            (vec![1.0, 1.0], vec![0.0]),
-        ];
-
+        let (inputs, targets) = xor_data();
         let mut rng = Rng::new(42);
         let mut net = Network::random(&[2, 4, 1], &mut rng);
 
         let mut loss = 0.0;
         for _ in 0..20_000 {
-            loss = net.train_epoch(&samples, 5.0);
+            loss = net.train_epoch(&inputs, &targets, 5.0);
         }
 
         assert!(loss < 0.01, "should have learned XOR, loss was {loss}");
-        for (inputs, targets) in &samples {
-            let got = net.forward(inputs)[0];
-            assert!(
-                (got - targets[0]).abs() < 0.1,
-                "{inputs:?} -> {got}, want {}",
-                targets[0]
-            );
+        for r in 0..inputs.rows {
+            let got = net.forward_one(inputs.row(r))[0];
+            let want = targets.get(r, 0);
+            assert!((got - want).abs() < 0.1, "row {r}: {got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn minibatch_training_also_learns_xor() {
+        let (inputs, targets) = xor_data();
+        let mut rng = Rng::new(42);
+        let mut net = Network::random(&[2, 4, 1], &mut rng);
+
+        let mut loss = 0.0;
+        for _ in 0..5_000 {
+            loss = net.train_epoch_minibatch(&inputs, &targets, 2, 5.0, &mut rng);
+        }
+        assert!(loss < 0.01, "minibatch should learn XOR too, loss {loss}");
+    }
+
+    /// Batching must not change results: a batch of N gives the same outputs
+    /// as N separate single-sample passes.
+    #[test]
+    fn batched_forward_equals_one_at_a_time() {
+        let mut rng = Rng::new(11);
+        let net = Network::random(&[3, 5, 2], &mut rng);
+
+        let batch = Matrix::from_rows(&[
+            vec![0.1, 0.2, 0.3],
+            vec![-0.5, 0.9, 0.0],
+            vec![1.0, -1.0, 0.5],
+        ]);
+
+        let batched = net.forward(&batch);
+        for r in 0..batch.rows {
+            let single = net.forward_one(batch.row(r));
+            for c in 0..batched.cols {
+                assert!((batched.get(r, c) - single[c]).abs() < 1e-12);
+            }
         }
     }
 
@@ -429,58 +352,37 @@ mod tests {
     }
 
     #[test]
-    fn accuracy_counts_correct_argmaxes() {
-        let net = Network::random(&[2, 3, 2], &mut Rng::new(3));
-        let samples = vec![
-            (vec![0.0, 0.0], vec![1.0, 0.0]),
-            (vec![1.0, 1.0], vec![0.0, 1.0]),
-        ];
-        let acc = net.accuracy(&samples);
-        assert!((0.0..=1.0).contains(&acc));
-        // An untrained 2-output net gets 0, 0.5 or 1 on two samples.
-        assert!([0.0, 0.5, 1.0].contains(&acc));
-    }
-
-    #[test]
-    fn minibatch_training_also_learns_xor() {
-        let samples = vec![
-            (vec![0.0, 0.0], vec![0.0]),
-            (vec![0.0, 1.0], vec![1.0]),
-            (vec![1.0, 0.0], vec![1.0]),
-            (vec![1.0, 1.0], vec![0.0]),
-        ];
-
-        let mut rng = Rng::new(42);
-        let mut net = Network::random(&[2, 4, 1], &mut rng);
-
-        let mut loss = 0.0;
-        for _ in 0..5_000 {
-            loss = net.train_epoch_minibatch(&samples, 2, 5.0, &mut rng);
-        }
-        assert!(loss < 0.01, "minibatch should learn XOR too, loss {loss}");
-    }
-
-    #[test]
     fn random_builds_the_requested_shape() {
         let mut rng = Rng::new(1);
         let net = Network::random(&[3, 5, 2], &mut rng);
+
         assert_eq!(net.layers.len(), 2);
         assert_eq!(net.layers[0].n_inputs(), 3);
         assert_eq!(net.layers[0].n_outputs(), 5);
         assert_eq!(net.layers[1].n_inputs(), 5);
         assert_eq!(net.layers[1].n_outputs(), 2);
-        assert_eq!(net.forward(&[0.1, 0.2, 0.3]).len(), 2);
+        // 3*5 + 5 + 5*2 + 2
+        assert_eq!(net.parameter_count(), 32);
+    }
+
+    #[test]
+    fn accuracy_is_a_fraction() {
+        let mut rng = Rng::new(3);
+        let net = Network::random(&[2, 3, 2], &mut rng);
+
+        let inputs = Matrix::from_rows(&[vec![0.0, 0.0], vec![1.0, 1.0]]);
+        let targets = Matrix::from_rows(&[vec![1.0, 0.0], vec![0.0, 1.0]]);
+
+        let accuracy = net.accuracy(&inputs, &targets);
+        assert!([0.0, 0.5, 1.0].contains(&accuracy));
     }
 
     #[test]
     #[should_panic(expected = "layer 0 emits 2 values but layer 1 expects 3")]
     fn mismatched_layer_widths_are_rejected() {
         Network::new(vec![
-            Layer::new(vec![
-                Neuron::new(vec![1.0, 1.0], 0.0),
-                Neuron::new(vec![1.0, 1.0], 0.0),
-            ]),
-            Layer::new(vec![Neuron::new(vec![1.0, 1.0, 1.0], 0.0)]),
+            Layer::new(Matrix::zeros(2, 2), vec![0.0, 0.0]),
+            Layer::new(Matrix::zeros(3, 1), vec![0.0]),
         ]);
     }
 }

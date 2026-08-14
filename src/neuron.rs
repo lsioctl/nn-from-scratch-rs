@@ -10,38 +10,19 @@
 //! (and a negative weight means "this input argues against firing"). The
 //! `bias` shifts how eager the neuron is to fire at all.
 
+//! NOTE: since the matrix refactor this is no longer the working
+//! implementation — `layer.rs` is. It is kept because it is the clearest
+//! statement of what a neuron *is*, and because it serves as an executable
+//! specification: `layer::tests::matrix_layer_agrees_with_the_neuron_implementation`
+//! builds the same layer both ways and demands identical outputs.
+
+use crate::activation::{sigmoid, sigmoid_derivative_from_output};
 use crate::loss::{squared_error, squared_error_derivative};
 use crate::rng::Rng;
 
-/// The logistic "sigmoid" activation.
-///
-/// Squashes any real number into the open range (0, 1):
-///   sigmoid(-inf) -> 0     sigmoid(0) = 0.5     sigmoid(+inf) -> 1
-///
-/// Why squash at all? Because without it, stacking neurons would be
-/// pointless: a sum of sums of sums is still just one big weighted sum, so
-/// a 100-layer network would collapse into something a single layer could
-/// do. The non-linearity is what makes depth worth anything.
-pub fn sigmoid(x: f64) -> f64 {
-    1.0 / (1.0 + (-x).exp())
-}
-
-/// The derivative of sigmoid — but expressed in terms of its *output*.
-///
-/// The identity is a small gift:
-///
-///     sigmoid'(z) = sigmoid(z) * (1 - sigmoid(z))
-///
-/// so if you already have `y = sigmoid(z)`, the slope is just `y * (1 - y)`.
-/// You never need to keep `z` around, and never need to call `exp` twice.
-///
-/// Look at the shape: it peaks at 0.25 when y = 0.5, and collapses toward 0
-/// as y approaches 0 or 1. That means a neuron which is *very* confident
-/// barely learns — its gradient is nearly zero. This is the "saturation"
-/// problem, and it will bite us later.
-pub fn sigmoid_derivative_from_output(y: f64) -> f64 {
-    y * (1.0 - y)
-}
+// `sigmoid` and `sigmoid_derivative_from_output` used to live here. They now
+// live in `activation.rs`, since an activation applies to a whole batch and is
+// not really a property of an individual neuron.
 
 /// A single neuron: one weight per input, plus one bias.
 #[derive(Debug, Clone)]

@@ -5,8 +5,8 @@ no autodiff. Pure `f64` arithmetic. The goal is understanding, not performance.
 
 ```sh
 ./fetch-mnist.sh        # one-off, downloads ~11 MB into ./data (gitignored)
-cargo run --release     # trains on MNIST — takes ~100s, do NOT use debug
-cargo test              # 34 tests, including numerical gradient checks
+cargo run --release     # trains on MNIST — takes ~27s, do NOT use debug
+cargo test              # 48 tests, including numerical gradient checks
 ```
 
 `--release` is not optional for MNIST: debug builds are roughly 30x slower here.
@@ -14,21 +14,29 @@ cargo test              # 34 tests, including numerical gradient checks
 ## Where we are
 
 A fully-connected feedforward network with sigmoid activations, trained by
-backpropagation with minibatch gradient descent.
+backpropagation with minibatch gradient descent. Implemented with matrices —
+a whole minibatch goes through in one matrix product.
 
-**95.63% test accuracy on MNIST** — `[784, 30, 10]`, 23,860 parameters,
-30 epochs, batch size 32, learning rate 3.0, ~100 seconds.
+**95.4% test accuracy on MNIST** — `[784, 30, 10]`, 23,860 parameters,
+30 epochs, batch size 32, learning rate 3.0, **27 seconds** (0.91 s/epoch).
 
 ## Module map
 
 | File | Holds |
 |---|---|
-| `src/neuron.rs` | `Neuron` — weights, bias, `forward`, and single-neuron gradients |
-| `src/layer.rs` | `Layer` — neurons side by side; `backward` lives here |
+| `src/matrix.rs` | `Matrix` — row-major dense f64, `matmul`, `transpose`, … |
+| `src/activation.rs` | `sigmoid` and its derivative |
+| `src/layer.rs` | `Layer` — a weight matrix + biases; forward and backward |
 | `src/network.rs` | `Network` — stacked layers, backprop, training loop |
 | `src/loss.rs` | Squared error and its derivative |
 | `src/mnist.rs` | IDX file parser, one-hot encoding, ASCII digit rendering |
 | `src/rng.rs` | xorshift64* — weight init and shuffling |
+| `src/neuron.rs` | **Reference only.** The original one-neuron-at-a-time code |
+
+`neuron.rs` is no longer live. It is kept because it is the clearest statement
+of what a neuron *is*, and because it is an executable specification:
+`layer::tests::matrix_layer_agrees_with_the_neuron_implementation` builds the
+same layer both ways and demands identical outputs.
 
 ## The path we took
 
@@ -46,6 +54,7 @@ Each commit is one concept, in order:
    code on XOR flatlines at loss 0.25, predicting 0.5 for everything.
 4. **`4d3fae9` backpropagation** — XOR learned from random weights.
 5. **MNIST** — real data. 95.63% on the held-out test set.
+6. **Matrix refactor** — same algorithm, same accuracy, 3.6x faster.
 
 ## Ideas worth not forgetting
 
@@ -95,6 +104,34 @@ stalled at ~95.6% and wobbled after epoch ~17. That ~2.4-point gap is
 generalise. The test set is the only honest number, which is why it must never
 be trained on.
 
+**The matrix formulation.** With `B` = batch, `I` = inputs, `O` = neurons:
+
+```
+X (B,I)   W (I,O)   b (O)
+
+forward:   Z = X·W + b        A = sigmoid(Z)
+backward:  dZ = dA ⊙ sigmoid'(A)
+           dW = Xᵀ·dZ         db = column sums of dZ
+           dX = dZ·Wᵀ
+```
+
+`W` is stored so that a *column* is one neuron's weights — the transpose of
+the list-of-neurons view. That is what makes `X·W` work out.
+
+The two transposes are not arbitrary. Forward, `X·W` contracts over inputs;
+going backward you must contract over the *other* index each time, and
+transposing is how you say that. Useful check when deriving: only one
+arrangement of each product has shapes that line up at all.
+
+**Loop order in `matmul` is most of the performance.** `i,k,j` beats the
+textbook `i,j,k` several times over. With `i,j,k` the inner loop reads
+`rhs[k][j]` for successive `k`, striding `n` floats through memory each step.
+With `i,k,j` it walks one contiguous row of `rhs` and one of the output,
+accumulating into them — cache-friendly and vectorisable.
+
+Skipping zero multipliers in `matmul` is worth real time on MNIST, where ~80%
+of every image is blank background.
+
 ## Gotchas paid for already
 
 **Always gradient-check.** Compare hand-derived gradients against
@@ -132,12 +169,13 @@ no such ordering.
 1. **ReLU + softmax + cross-entropy.** The biggest accuracy win available.
    Fixes saturation, and is why nobody trains a classifier with MSE.
    Cross-entropy's gradient through softmax simplifies beautifully to `(y - t)`
-   — cleaner than what we have now. Should reach ~97-98%.
-2. **Refactor to matrices.** Collapse the per-neuron loops into matrix
-   multiplication — far faster than the current ~3.3 s/epoch, and much closer
-   to how real frameworks are built.
-3. **Fight the overfitting** seen above: L2 regularisation, dropout, or just
+   — cleaner than what we have now. Should reach ~97-98%. Now easy: activations
+   are isolated in `activation.rs` and applied elementwise to a matrix.
+2. **Fight the overfitting** seen above: L2 regularisation, dropout, or just
    early stopping on a proper validation split carved out of the training set.
+3. **Go faster still.** Parallelise `matmul` across rows with threads; cut the
+   allocation churn (`backward` clones two matrices per layer per batch);
+   or block the matmul for cache reuse.
 
 Also unaddressed: momentum/Adam, learning-rate schedules, convolutions (the
 architecture that actually suits images), and saving/loading trained weights —
