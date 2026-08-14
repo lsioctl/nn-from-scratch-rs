@@ -165,11 +165,15 @@ impl Network {
         (gradients, loss)
     }
 
-    /// One pass over the dataset: accumulate gradients from every example,
-    /// average them, then take a single step.
+    /// Accumulate gradients over the selected samples, average, take one step.
     ///
-    /// Returns the mean loss *before* the update.
-    pub fn train_epoch(&mut self, samples: &[(Vec<f64>, Vec<f64>)], learning_rate: f64) -> f64 {
+    /// Returns the *summed* loss, so callers can average however they like.
+    fn train_batch(
+        &mut self,
+        samples: &[(Vec<f64>, Vec<f64>)],
+        indices: &[usize],
+        learning_rate: f64,
+    ) -> f64 {
         let mut totals: Vec<LayerGradients> = self
             .layers
             .iter()
@@ -177,7 +181,8 @@ impl Network {
             .collect();
         let mut total_loss = 0.0;
 
-        for (inputs, targets) in samples {
+        for &i in indices {
+            let (inputs, targets) = &samples[i];
             let (gradients, loss) = self.gradients(inputs, targets);
             total_loss += loss;
             for (acc, g) in totals.iter_mut().zip(&gradients) {
@@ -185,14 +190,93 @@ impl Network {
             }
         }
 
-        let scale = 1.0 / samples.len() as f64;
+        let scale = 1.0 / indices.len() as f64;
         for (layer, gradients) in self.layers.iter_mut().zip(&mut totals) {
             gradients.scale(scale);
             layer.apply_gradients(gradients, learning_rate);
         }
 
-        total_loss * scale
+        total_loss
     }
+
+    /// One pass over the whole dataset as a single batch, one weight update.
+    ///
+    /// Fine for four XOR examples. Hopeless for 60,000 digits — see
+    /// `train_epoch_minibatch`.
+    pub fn train_epoch(&mut self, samples: &[(Vec<f64>, Vec<f64>)], learning_rate: f64) -> f64 {
+        let indices: Vec<usize> = (0..samples.len()).collect();
+        self.train_batch(samples, &indices, learning_rate) / samples.len() as f64
+    }
+
+    /// One pass over the dataset in shuffled minibatches — the workhorse.
+    ///
+    /// Full-batch descent computes a beautifully accurate gradient and then
+    /// takes *one* step with it. Across 60,000 examples that is a colossal
+    /// amount of arithmetic per update, and training would take days.
+    ///
+    /// Minibatching computes a rougher gradient from (say) 32 examples and
+    /// steps immediately, giving ~1,875 updates per pass instead of one. The
+    /// estimate is noisy, but noise is affordable and, in practice, mildly
+    /// helpful — it can knock the network out of shallow local minima.
+    ///
+    /// The shuffle matters: MNIST is not stored in random order, and batches
+    /// that were all-the-same-digit would drag the weights around in circles.
+    ///
+    /// Returns the mean per-example loss over the epoch.
+    pub fn train_epoch_minibatch(
+        &mut self,
+        samples: &[(Vec<f64>, Vec<f64>)],
+        batch_size: usize,
+        learning_rate: f64,
+        rng: &mut Rng,
+    ) -> f64 {
+        assert!(batch_size > 0, "batch size must be positive");
+
+        let mut order: Vec<usize> = (0..samples.len()).collect();
+        rng.shuffle(&mut order);
+
+        let mut total_loss = 0.0;
+        for batch in order.chunks(batch_size) {
+            total_loss += self.train_batch(samples, batch, learning_rate);
+        }
+
+        total_loss / samples.len() as f64
+    }
+
+    /// The index of the largest output — the network's actual answer.
+    ///
+    /// With ten output neurons, "which digit is this?" means "which neuron is
+    /// most excited?". The raw values are not probabilities (they do not sum
+    /// to 1 — softmax would fix that), but for picking a winner it makes no
+    /// difference.
+    pub fn predict(&self, inputs: &[f64]) -> usize {
+        argmax(&self.forward(inputs))
+    }
+
+    /// Fraction of samples classified correctly, in [0, 1].
+    ///
+    /// This — not the loss — is what you actually care about. Loss is what we
+    /// can differentiate; accuracy is what the task is.
+    pub fn accuracy(&self, samples: &[(Vec<f64>, Vec<f64>)]) -> f64 {
+        let correct = samples
+            .iter()
+            .filter(|(inputs, targets)| self.predict(inputs) == argmax(targets))
+            .count();
+
+        correct as f64 / samples.len() as f64
+    }
+}
+
+/// Index of the largest value. Ties go to the earliest.
+pub fn argmax(values: &[f64]) -> usize {
+    values
+        .iter()
+        .enumerate()
+        .fold(
+            (0, f64::NEG_INFINITY),
+            |(best_i, best), (i, &v)| if v > best { (i, v) } else { (best_i, best) },
+        )
+        .0
 }
 
 #[cfg(test)]
@@ -334,6 +418,46 @@ mod tests {
                 targets[0]
             );
         }
+    }
+
+    #[test]
+    fn argmax_picks_the_largest() {
+        assert_eq!(argmax(&[0.1, 0.9, 0.3]), 1);
+        assert_eq!(argmax(&[5.0, 1.0, 1.0]), 0);
+        assert_eq!(argmax(&[0.0, 0.0, 7.0]), 2);
+        assert_eq!(argmax(&[2.0, 2.0]), 0, "ties go to the earliest");
+    }
+
+    #[test]
+    fn accuracy_counts_correct_argmaxes() {
+        let net = Network::random(&[2, 3, 2], &mut Rng::new(3));
+        let samples = vec![
+            (vec![0.0, 0.0], vec![1.0, 0.0]),
+            (vec![1.0, 1.0], vec![0.0, 1.0]),
+        ];
+        let acc = net.accuracy(&samples);
+        assert!((0.0..=1.0).contains(&acc));
+        // An untrained 2-output net gets 0, 0.5 or 1 on two samples.
+        assert!([0.0, 0.5, 1.0].contains(&acc));
+    }
+
+    #[test]
+    fn minibatch_training_also_learns_xor() {
+        let samples = vec![
+            (vec![0.0, 0.0], vec![0.0]),
+            (vec![0.0, 1.0], vec![1.0]),
+            (vec![1.0, 0.0], vec![1.0]),
+            (vec![1.0, 1.0], vec![0.0]),
+        ];
+
+        let mut rng = Rng::new(42);
+        let mut net = Network::random(&[2, 4, 1], &mut rng);
+
+        let mut loss = 0.0;
+        for _ in 0..5_000 {
+            loss = net.train_epoch_minibatch(&samples, 2, 5.0, &mut rng);
+        }
+        assert!(loss < 0.01, "minibatch should learn XOR too, loss {loss}");
     }
 
     #[test]

@@ -37,6 +37,23 @@ impl Rng {
     pub fn uniform(&mut self, lo: f64, hi: f64) -> f64 {
         lo + (hi - lo) * self.next_f64()
     }
+
+    /// An integer in [0, n). Slightly biased, which does not matter for
+    /// shuffling training data.
+    pub fn below(&mut self, n: usize) -> usize {
+        ((self.next_f64() * n as f64) as usize).min(n - 1)
+    }
+
+    /// Fisher-Yates shuffle, in place.
+    ///
+    /// Walk from the back, swapping each element with a random one at or
+    /// before it. Every permutation comes out equally likely.
+    pub fn shuffle<T>(&mut self, items: &mut [T]) {
+        for i in (1..items.len()).rev() {
+            let j = self.below(i + 1);
+            items.swap(i, j);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -70,6 +87,27 @@ mod tests {
         let mut a = Rng::new(1);
         let mut b = Rng::new(2);
         assert_ne!(a.next_f64(), b.next_f64());
+    }
+
+    #[test]
+    fn shuffle_permutes_without_losing_anything() {
+        let mut rng = Rng::new(5);
+        let mut items: Vec<usize> = (0..100).collect();
+        rng.shuffle(&mut items);
+
+        assert_ne!(items, (0..100).collect::<Vec<_>>(), "should have moved");
+
+        items.sort();
+        assert_eq!(items, (0..100).collect::<Vec<_>>(), "same elements");
+    }
+
+    #[test]
+    fn below_stays_in_bounds() {
+        let mut rng = Rng::new(11);
+        for _ in 0..1000 {
+            assert!(rng.below(7) < 7);
+            assert_eq!(rng.below(1), 0);
+        }
     }
 
     #[test]
