@@ -6,7 +6,9 @@
 //! simultaneously, and the per-sample loop that used to wrap the whole thing
 //! is gone.
 
+use crate::activation::Activation;
 use crate::layer::{Layer, LayerGradients};
+use crate::loss::{cross_entropy, softmax_cross_entropy_gradient, squared_error_derivative};
 use crate::matrix::Matrix;
 use crate::rng::Rng;
 
@@ -36,15 +38,42 @@ impl Network {
     /// Build a network of the given shape with random weights.
     ///
     /// `&[784, 30, 10]` means 784 inputs, a hidden layer of 30, 10 outputs.
-    pub fn random(sizes: &[usize], rng: &mut Rng) -> Self {
+    /// Every hidden layer gets `hidden`; the final layer gets `output`.
+    pub fn random(
+        sizes: &[usize],
+        hidden: Activation,
+        output: Activation,
+        rng: &mut Rng,
+    ) -> Self {
         assert!(sizes.len() >= 2, "need at least an input and an output size");
 
+        let last = sizes.len() - 2;
         Self::new(
             sizes
                 .windows(2)
-                .map(|pair| Layer::random(pair[0], pair[1], rng))
+                .enumerate()
+                .map(|(i, pair)| {
+                    let activation = if i == last { output } else { hidden };
+                    Layer::random(pair[0], pair[1], activation, rng)
+                })
                 .collect(),
         )
+    }
+
+    /// A classifier: ReLU hidden layers, softmax output, cross-entropy loss.
+    pub fn classifier(sizes: &[usize], rng: &mut Rng) -> Self {
+        Self::random(sizes, Activation::Relu, Activation::Softmax, rng)
+    }
+
+    /// The old all-sigmoid network, trained with squared error.
+    pub fn sigmoid_network(sizes: &[usize], rng: &mut Rng) -> Self {
+        Self::random(sizes, Activation::Sigmoid, Activation::Sigmoid, rng)
+    }
+
+    /// True when this network ends in softmax, and therefore uses
+    /// cross-entropy rather than squared error.
+    pub fn is_classifier(&self) -> bool {
+        self.layers.last().unwrap().activation == Activation::Softmax
     }
 
     /// Push a batch through every layer. `(B, inputs) -> (B, outputs)`.
@@ -95,25 +124,58 @@ impl Network {
             outputs.cols, targets.cols
         );
 
-        // 2. Loss and its seed, both elementwise over the whole batch.
-        //    Summed over outputs *and* samples; the caller divides by B.
-        let mut loss = 0.0;
-        let mut d_outputs = Matrix::zeros(outputs.rows, outputs.cols);
-        for (i, (&o, &t)) in outputs.data.iter().zip(&targets.data).enumerate() {
-            let error = o - t;
-            loss += error * error;
-            d_outputs.data[i] = 2.0 * error;
-        }
-
-        // 3. Walk backwards. Layer k consumed activations[k], produced
-        //    activations[k + 1].
         let mut gradients = Vec::with_capacity(self.layers.len());
-        for (k, layer) in self.layers.iter().enumerate().rev() {
+        let last = self.layers.len() - 1;
+
+        // 2. Seed the error at the output, and 3. take the first step back.
+        //
+        //    The two paths differ in *what* they hand the layer:
+        //
+        //    - softmax + cross-entropy gives dL/dz directly (`y - t`), because
+        //      softmax has no elementwise derivative to apply. It goes
+        //      straight into the second half of the backward pass.
+        //    - anything else gives dL/da (`2(y - t)` for squared error) and
+        //      lets the layer apply its own activation derivative.
+        let (loss, mut d_values) = if self.is_classifier() {
+            let mut d_z = Matrix::zeros(outputs.rows, outputs.cols);
+            for (i, (&o, &t)) in outputs.data.iter().zip(&targets.data).enumerate() {
+                d_z.data[i] = softmax_cross_entropy_gradient(o, t);
+            }
+
+            let loss: f64 = (0..outputs.rows)
+                .map(|r| cross_entropy(outputs.row(r), targets.row(r)))
+                .sum();
+
+            let (layer_gradients, d_inputs) = self.layers[last]
+                .backward_from_pre_activation(&activations[last], &d_z);
+            gradients.push(layer_gradients);
+
+            (loss, d_inputs)
+        } else {
+            let mut loss = 0.0;
+            let mut d_a = Matrix::zeros(outputs.rows, outputs.cols);
+            for (i, (&o, &t)) in outputs.data.iter().zip(&targets.data).enumerate() {
+                loss += (o - t) * (o - t);
+                d_a.data[i] = squared_error_derivative(o, t);
+            }
+
+            let (layer_gradients, d_inputs) = self.layers[last].backward(
+                &activations[last],
+                &activations[last + 1],
+                &d_a,
+            );
+            gradients.push(layer_gradients);
+
+            (loss, d_inputs)
+        };
+
+        // 4. The remaining layers are all ordinary — walk them backwards.
+        for k in (0..last).rev() {
             let (layer_gradients, d_inputs) =
-                layer.backward(&activations[k], &activations[k + 1], &d_outputs);
+                self.layers[k].backward(&activations[k], &activations[k + 1], &d_values);
 
             gradients.push(layer_gradients);
-            d_outputs = d_inputs;
+            d_values = d_inputs;
         }
 
         gradients.reverse();
@@ -221,17 +283,11 @@ mod tests {
         (inputs, targets)
     }
 
-    /// Gradient check, on the matrix implementation, over a batch.
-    ///
-    /// The transposes in `Layer::backward` are exactly the kind of thing that
-    /// is easy to get backwards and impossible to notice by eye. This nails
-    /// every weight against a numerical estimate.
+    /// Gradient check for the sigmoid + squared-error path.
     #[test]
     fn backprop_matches_numerical_gradients() {
         let mut rng = Rng::new(7);
-        // Lopsided shape and a batch of 3, so any confusion between batch,
-        // input and neuron axes shows up.
-        let net = Network::random(&[3, 4, 2], &mut rng);
+        let net = Network::sigmoid_network(&[3, 4, 2], &mut rng);
 
         let inputs = Matrix::from_rows(&[
             vec![0.6, -0.2, 0.9],
@@ -244,16 +300,57 @@ mod tests {
             vec![1.0, 1.0],
         ]);
 
-        let (gradients, _) = net.gradients(&inputs, &targets);
+        check_gradients_numerically(&net, &inputs, &targets);
+    }
+
+    /// Gradient check for the ReLU + softmax + cross-entropy path.
+    ///
+    /// This is the one that matters most in this step. The `y - t` shortcut is
+    /// a *claim* that softmax's Jacobian and cross-entropy's `-t/y` cancel;
+    /// this verifies the claim end to end, through a ReLU hidden layer, by
+    /// nudging every weight and watching the actual cross-entropy loss move.
+    #[test]
+    fn softmax_cross_entropy_backprop_matches_numerical_gradients() {
+        let mut rng = Rng::new(13);
+        let net = Network::classifier(&[3, 5, 4], &mut rng);
+        assert!(net.is_classifier());
+
+        let inputs = Matrix::from_rows(&[
+            vec![0.6, -0.2, 0.9],
+            vec![0.1, 0.5, -0.4],
+            vec![-0.8, 0.3, 0.2],
+        ]);
+        // One-hot targets, as a real classifier would have.
+        let targets = Matrix::from_rows(&[
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+        ]);
+
+        check_gradients_numerically(&net, &inputs, &targets);
+    }
+
+    /// Nudge every weight and bias by ±h and compare the measured change in
+    /// loss against the analytic gradient. Uses whichever loss the network's
+    /// output activation implies.
+    fn check_gradients_numerically(net: &Network, inputs: &Matrix, targets: &Matrix) {
+        let (gradients, _) = net.gradients(inputs, targets);
         let h = 1e-6;
 
+        let is_classifier = net.is_classifier();
         let loss_of = |n: &Network| -> f64 {
-            let out = n.forward(&inputs);
-            out.data
-                .iter()
-                .zip(&targets.data)
-                .map(|(&o, &t)| (o - t) * (o - t))
-                .sum()
+            let out = n.forward(inputs);
+            if is_classifier {
+                (0..out.rows)
+                    .map(|r| cross_entropy(out.row(r), targets.row(r)))
+                    .sum()
+            } else {
+                out.data
+                    .iter()
+                    .zip(&targets.data)
+                    .map(|(&o, &t)| (o - t) * (o - t))
+                    .sum()
+            }
         };
 
         for k in 0..net.layers.len() {
@@ -293,7 +390,7 @@ mod tests {
     fn backprop_learns_xor_from_random_weights() {
         let (inputs, targets) = xor_data();
         let mut rng = Rng::new(42);
-        let mut net = Network::random(&[2, 4, 1], &mut rng);
+        let mut net = Network::sigmoid_network(&[2, 4, 1], &mut rng);
 
         let mut loss = 0.0;
         for _ in 0..20_000 {
@@ -312,7 +409,7 @@ mod tests {
     fn minibatch_training_also_learns_xor() {
         let (inputs, targets) = xor_data();
         let mut rng = Rng::new(42);
-        let mut net = Network::random(&[2, 4, 1], &mut rng);
+        let mut net = Network::sigmoid_network(&[2, 4, 1], &mut rng);
 
         let mut loss = 0.0;
         for _ in 0..5_000 {
@@ -326,7 +423,7 @@ mod tests {
     #[test]
     fn batched_forward_equals_one_at_a_time() {
         let mut rng = Rng::new(11);
-        let net = Network::random(&[3, 5, 2], &mut rng);
+        let net = Network::sigmoid_network(&[3, 5, 2], &mut rng);
 
         let batch = Matrix::from_rows(&[
             vec![0.1, 0.2, 0.3],
@@ -354,7 +451,7 @@ mod tests {
     #[test]
     fn random_builds_the_requested_shape() {
         let mut rng = Rng::new(1);
-        let net = Network::random(&[3, 5, 2], &mut rng);
+        let net = Network::sigmoid_network(&[3, 5, 2], &mut rng);
 
         assert_eq!(net.layers.len(), 2);
         assert_eq!(net.layers[0].n_inputs(), 3);
@@ -368,7 +465,7 @@ mod tests {
     #[test]
     fn accuracy_is_a_fraction() {
         let mut rng = Rng::new(3);
-        let net = Network::random(&[2, 3, 2], &mut rng);
+        let net = Network::sigmoid_network(&[2, 3, 2], &mut rng);
 
         let inputs = Matrix::from_rows(&[vec![0.0, 0.0], vec![1.0, 1.0]]);
         let targets = Matrix::from_rows(&[vec![1.0, 0.0], vec![0.0, 1.0]]);
@@ -381,8 +478,8 @@ mod tests {
     #[should_panic(expected = "layer 0 emits 2 values but layer 1 expects 3")]
     fn mismatched_layer_widths_are_rejected() {
         Network::new(vec![
-            Layer::new(Matrix::zeros(2, 2), vec![0.0, 0.0]),
-            Layer::new(Matrix::zeros(3, 1), vec![0.0]),
+            Layer::new(Matrix::zeros(2, 2), vec![0.0, 0.0], Activation::Sigmoid),
+            Layer::new(Matrix::zeros(3, 1), vec![0.0], Activation::Sigmoid),
         ]);
     }
 }

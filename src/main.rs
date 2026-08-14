@@ -20,13 +20,15 @@ use network::Network;
 use rng::Rng;
 
 const DATA_DIR: &str = "data";
-
-/// 784 pixels in, one hidden layer of 30, 10 digit outputs.
-const SHAPE: &[usize] = &[784, 30, 10];
-
+const SHAPE: &[usize] = &[784, 100, 10];
 const EPOCHS: usize = 30;
 const BATCH_SIZE: usize = 32;
-const LEARNING_RATE: f64 = 3.0;
+
+/// Cross-entropy produces much larger gradients than squared error — there is
+/// no `y(1-y)` factor shrinking them — so the classifier needs a far gentler
+/// learning rate than the sigmoid network's 3.0.
+const CLASSIFIER_LEARNING_RATE: f64 = 0.3;
+const SIGMOID_LEARNING_RATE: f64 = 3.0;
 
 fn main() -> ExitCode {
     let (train, test) = match (mnist::load_training(DATA_DIR), mnist::load_test(DATA_DIR)) {
@@ -38,63 +40,100 @@ fn main() -> ExitCode {
         }
     };
 
-    println!("MNIST: {} training digits, {} test digits\n", train.len(), test.len());
-    println!("First training digit (label: {}):\n", train.labels[0]);
-    println!("{}\n", mnist::render(&train.images[0]));
-
-    // Flatten both splits into matrices once, up front.
     let (train_x, train_y) = train.to_matrices();
     let (test_x, test_y) = test.to_matrices();
 
-    // A fixed 10k slice of the training set, for watching the train/test gap.
     let probe: Vec<usize> = (0..10_000).collect();
-    let (probe_x, probe_y) = (train_x.select_rows(&probe), train_y.select_rows(&probe));
+    let probe_x = train_x.select_rows(&probe);
+    let probe_y = train_y.select_rows(&probe);
 
-    let mut rng = Rng::new(42);
-    let mut net = Network::random(SHAPE, &mut rng);
+    println!("MNIST: {} training digits, {} test digits", train.len(), test.len());
+    println!("Network {SHAPE:?}, {EPOCHS} epochs, batch size {BATCH_SIZE}\n");
 
-    println!("Network {SHAPE:?}  —  {} parameters", net.parameter_count());
-    println!("{EPOCHS} epochs, batch size {BATCH_SIZE}, learning rate {LEARNING_RATE}\n");
-
-    println!("  epoch |     loss  |   train acc   test acc  |   time");
-    println!("  ------+-----------+-------------------------+--------");
-
-    let started = Instant::now();
-    for epoch in 1..=EPOCHS {
-        let loss = net.train_epoch_minibatch(&train_x, &train_y, BATCH_SIZE, LEARNING_RATE, &mut rng);
-
-        println!(
-            "  {epoch:>5} |  {loss:.5}  |     {:>5.2}%     {:>5.2}%  |  {:>5.1}s",
-            net.accuracy(&probe_x, &probe_y) * 100.0,
-            net.accuracy(&test_x, &test_y) * 100.0,
-            started.elapsed().as_secs_f64(),
-        );
-    }
-
-    let elapsed = started.elapsed().as_secs_f64();
-    let accuracy = net.accuracy(&test_x, &test_y);
-
-    println!("\nFinal test accuracy: {:.2}%", accuracy * 100.0);
-    println!(
-        "({} of {} digits correct, {} wrong)",
-        (accuracy * test_y.rows as f64).round() as usize,
-        test_y.rows,
-        ((1.0 - accuracy) * test_y.rows as f64).round() as usize,
-    );
-    println!(
-        "Trained in {elapsed:.1}s — {:.2}s per epoch\n",
-        elapsed / EPOCHS as f64
+    // Train both, from the same seed, so the comparison is fair.
+    let old = train_one(
+        "sigmoid hidden + sigmoid output, squared error",
+        Network::sigmoid_network(SHAPE, &mut Rng::new(42)),
+        SIGMOID_LEARNING_RATE,
+        (&train_x, &train_y),
+        (&probe_x, &probe_y),
+        (&test_x, &test_y),
     );
 
-    report_confusions(&net, &test_x, &test);
-    show_a_mistake(&net, &test_x, &test);
+    let new = train_one(
+        "ReLU hidden + softmax output, cross-entropy",
+        Network::classifier(SHAPE, &mut Rng::new(42)),
+        CLASSIFIER_LEARNING_RATE,
+        (&train_x, &train_y),
+        (&probe_x, &probe_y),
+        (&test_x, &test_y),
+    );
+
+    println!("=======================================================");
+    println!("  sigmoid + squared error :  {:.2}%", old.accuracy * 100.0);
+    println!("  ReLU + softmax + x-ent  :  {:.2}%", new.accuracy * 100.0);
+    println!(
+        "  {} errors -> {} errors  ({:.0}% fewer)",
+        ((1.0 - old.accuracy) * 10_000.0).round(),
+        ((1.0 - new.accuracy) * 10_000.0).round(),
+        (1.0 - (1.0 - new.accuracy) / (1.0 - old.accuracy)) * 100.0
+    );
+    println!("=======================================================\n");
+
+    report_confusions(&new.net, &test_x, &test);
+    show_confidence(&new.net, &test_x, &test);
 
     ExitCode::SUCCESS
 }
 
-/// Which digits does it confuse for which?
+struct Trained {
+    net: Network,
+    accuracy: f64,
+}
+
+fn train_one(
+    label: &str,
+    mut net: Network,
+    learning_rate: f64,
+    train: (&Matrix, &Matrix),
+    probe: (&Matrix, &Matrix),
+    test: (&Matrix, &Matrix),
+) -> Trained {
+    println!("--- {label} ---");
+    println!("learning rate {learning_rate}\n");
+    println!("  epoch |     loss  |   train acc   test acc  |   time");
+    println!("  ------+-----------+-------------------------+--------");
+
+    let mut rng = Rng::new(7);
+    let started = Instant::now();
+
+    for epoch in 1..=EPOCHS {
+        let loss = net.train_epoch_minibatch(train.0, train.1, BATCH_SIZE, learning_rate, &mut rng);
+
+        // Print the first few epochs and then every fifth, to keep it short
+        // while still showing how fast the classifier starts.
+        if epoch <= 3 || epoch % 5 == 0 {
+            println!(
+                "  {epoch:>5} |  {loss:.5}  |     {:>5.2}%     {:>5.2}%  |  {:>5.1}s",
+                net.accuracy(probe.0, probe.1) * 100.0,
+                net.accuracy(test.0, test.1) * 100.0,
+                started.elapsed().as_secs_f64(),
+            );
+        }
+    }
+
+    let accuracy = net.accuracy(test.0, test.1);
+    println!(
+        "\n  final: {:.2}%  ({} of 10000 wrong)  in {:.1}s\n",
+        accuracy * 100.0,
+        ((1.0 - accuracy) * 10_000.0).round() as usize,
+        started.elapsed().as_secs_f64(),
+    );
+
+    Trained { net, accuracy }
+}
+
 fn report_confusions(net: &Network, inputs: &Matrix, data: &mnist::MnistData) {
-    // One big forward pass for all 10,000 test digits.
     let outputs = net.forward(inputs);
 
     let mut matrix = [[0usize; 10]; 10];
@@ -102,8 +141,7 @@ fn report_confusions(net: &Network, inputs: &Matrix, data: &mnist::MnistData) {
         matrix[actual as usize][network::argmax(outputs.row(row))] += 1;
     }
 
-    println!("Confusion matrix — rows are the true digit, columns the guess.");
-    println!("The diagonal is correct answers; everything else is a mistake.\n");
+    println!("Confusion matrix — rows are the true digit, columns the guess.\n");
     print!("        ");
     for guess in 0..10 {
         print!("{guess:>5}");
@@ -124,25 +162,56 @@ fn report_confusions(net: &Network, inputs: &Matrix, data: &mnist::MnistData) {
     println!();
 }
 
-/// Show one digit the network got wrong.
-fn show_a_mistake(net: &Network, inputs: &Matrix, data: &mnist::MnistData) {
+/// Softmax outputs are a real probability distribution, so "confidence" now
+/// means something it did not before.
+fn show_confidence(net: &Network, inputs: &Matrix, data: &mnist::MnistData) {
     let outputs = net.forward(inputs);
 
+    let mut right = (0.0, 0usize);
+    let mut wrong = (0.0, 0usize);
+
+    for row in 0..outputs.rows {
+        let scores = outputs.row(row);
+        let guess = network::argmax(scores);
+        let bucket = if guess == data.labels[row] as usize {
+            &mut right
+        } else {
+            &mut wrong
+        };
+        bucket.0 += scores[guess];
+        bucket.1 += 1;
+    }
+
+    println!("Softmax outputs sum to 1, so they read as probabilities:\n");
+    println!(
+        "  when correct ({:>5} digits):  average confidence {:.1}%",
+        right.1,
+        right.0 / right.1 as f64 * 100.0
+    );
+    println!(
+        "  when wrong   ({:>5} digits):  average confidence {:.1}%",
+        wrong.1,
+        wrong.0 / wrong.1 as f64 * 100.0
+    );
+    println!("\nIt is measurably less sure when it is about to be wrong — which");
+    println!("is something the old ten-independent-sigmoids output could not");
+    println!("express, since its outputs never had to sum to anything.");
+
+    // One mistake, with the full distribution.
     let mistake = (0..outputs.rows)
         .find(|&r| network::argmax(outputs.row(r)) != data.labels[r] as usize);
 
-    let Some(index) = mistake else {
-        println!("No mistakes at all — suspicious.");
-        return;
-    };
-
-    let scores = outputs.row(index);
-    let actual = data.labels[index];
-    let guess = network::argmax(scores);
-
-    println!("A digit it got wrong (test image #{index}):\n");
-    println!("{}\n", mnist::render(&data.images[index]));
-    println!("  true answer: {actual}");
-    println!("  it guessed:  {guess}  (confidence {:.2})", scores[guess]);
-    println!("  it gave {actual} a score of {:.2}", scores[actual as usize]);
+    if let Some(index) = mistake {
+        let scores = outputs.row(index);
+        println!("\nIts first mistake (test image #{index}):\n");
+        println!("{}\n", mnist::render(&data.images[index]));
+        println!("  true answer: {}", data.labels[index]);
+        print!("  distribution:");
+        for (digit, &p) in scores.iter().enumerate() {
+            if p >= 0.01 {
+                print!("  {digit}:{:.0}%", p * 100.0);
+            }
+        }
+        println!();
+    }
 }

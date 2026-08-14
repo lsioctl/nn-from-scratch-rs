@@ -5,30 +5,37 @@ no autodiff. Pure `f64` arithmetic. The goal is understanding, not performance.
 
 ```sh
 ./fetch-mnist.sh        # one-off, downloads ~11 MB into ./data (gitignored)
-cargo run --release     # trains on MNIST — takes ~27s, do NOT use debug
-cargo test              # 48 tests, including numerical gradient checks
+cargo run --release     # trains BOTH networks on MNIST — takes ~2 min
+cargo test              # 59 tests, including numerical gradient checks
 ```
 
 `--release` is not optional for MNIST: debug builds are roughly 30x slower here.
 
 ## Where we are
 
-A fully-connected feedforward network with sigmoid activations, trained by
-backpropagation with minibatch gradient descent. Implemented with matrices —
-a whole minibatch goes through in one matrix product.
+A fully-connected feedforward network trained by backpropagation with
+minibatch gradient descent, implemented with matrices — a whole minibatch goes
+through in one matrix product.
 
-**95.4% test accuracy on MNIST** — `[784, 30, 10]`, 23,860 parameters,
-30 epochs, batch size 32, learning rate 3.0, **27 seconds** (0.91 s/epoch).
+**98.05% test accuracy on MNIST** — `[784, 100, 10]`, ReLU hidden + softmax
+output + cross-entropy, 30 epochs, batch 32, learning rate 0.3, ~46 s.
+
+`main` trains both the old and new setup side by side from the same seed:
+
+| | accuracy | errors | time |
+|---|---|---|---|
+| sigmoid + squared error | 97.78% | 222 | 73 s |
+| ReLU + softmax + cross-entropy | **98.05%** | **195** | **46 s** |
 
 ## Module map
 
 | File | Holds |
 |---|---|
 | `src/matrix.rs` | `Matrix` — row-major dense f64, `matmul`, `transpose`, … |
-| `src/activation.rs` | `sigmoid` and its derivative |
+| `src/activation.rs` | `Activation` enum — sigmoid, ReLU, softmax, plus init scales |
 | `src/layer.rs` | `Layer` — a weight matrix + biases; forward and backward |
 | `src/network.rs` | `Network` — stacked layers, backprop, training loop |
-| `src/loss.rs` | Squared error and its derivative |
+| `src/loss.rs` | Squared error and cross-entropy, and their derivatives |
 | `src/mnist.rs` | IDX file parser, one-hot encoding, ASCII digit rendering |
 | `src/rng.rs` | xorshift64* — weight init and shuffling |
 | `src/neuron.rs` | **Reference only.** The original one-neuron-at-a-time code |
@@ -55,6 +62,7 @@ Each commit is one concept, in order:
 4. **`4d3fae9` backpropagation** — XOR learned from random weights.
 5. **MNIST** — real data. 95.63% on the held-out test set.
 6. **Matrix refactor** — same algorithm, same accuracy, 3.6x faster.
+7. **ReLU + softmax + cross-entropy** — 98.05%, and 1.6x faster per epoch.
 
 ## Ideas worth not forgetting
 
@@ -98,11 +106,12 @@ of 32 give ~1,875 updates per pass from noisier gradients, and the noise is
 affordable — even mildly useful for escaping shallow local minima. Shuffle
 every epoch: MNIST is not stored in random order.
 
-**Train/test split.** Training accuracy reached 98.06% while test accuracy
-stalled at ~95.6% and wobbled after epoch ~17. That ~2.4-point gap is
-**overfitting** — the network memorising training specifics that do not
-generalise. The test set is the only honest number, which is why it must never
-be trained on.
+**Train/test split.** The classifier reaches **100.00%** on training data by
+epoch 20 while test accuracy sits at 98.05% and stops moving. That is
+**overfitting** made unusually vivid: training loss keeps falling (0.00104 ->
+0.00051) and buys nothing at all. Once training accuracy is saturated, the
+gradient is only sharpening answers it already has right. The test set is the
+only honest number, which is why it must never be trained on.
 
 **The matrix formulation.** With `B` = batch, `I` = inputs, `O` = neurons:
 
@@ -131,6 +140,53 @@ accumulating into them — cache-friendly and vectorisable.
 
 Skipping zero multipliers in `matmul` is worth real time on MNIST, where ~80%
 of every image is blank background.
+
+**ReLU.** `max(0, x)`, derivative **1** for any positive input rather than
+sigmoid's 0.25 peak. The gradient passes back untouched however deep the
+network, instead of being multiplied by <=0.25 at every layer. That single
+property is most of why deep networks became trainable. The cost: a neuron
+pushed firmly negative gets derivative 0 and stops learning permanently — a
+"dead" neuron. Enough survive that it rarely matters.
+
+**Softmax** turns arbitrary scores into a distribution: all positive, summing
+to 1. Unlike ten independent sigmoids, the outputs now *compete* — raising one
+lowers the others. Always subtract the row max before exponentiating; `exp(1000)`
+is `inf` and a mid-training network will produce scores that large. Subtracting
+a constant leaves the result mathematically identical because it cancels
+between numerator and denominator.
+
+**Cross-entropy** is `-ln(y_correct)` for one-hot targets — only the
+probability of the true answer matters. It is unbounded, so a confident mistake
+costs 4.6 (at p=0.01) or 20+ (at p=1e-10), where squared error is capped at 1.0
+per output no matter how wrong.
+
+**The fusion is the whole point.** Softmax's true derivative is a full Jacobian;
+cross-entropy's is `-t/y`, which explodes as `y -> 0`. Composed, everything
+cancels:
+
+```
+dL/dz = y - t
+```
+
+Prediction minus target. No Jacobian, no division, nothing to overflow. This is
+why the two are *always* used as a pair. Contrast sigmoid + squared error, whose
+`dL/dz` carries a factor of `y(1-y)` — so a confidently wrong output barely
+learns from its worst mistake. Softmax + cross-entropy has no such factor: the
+more wrong it is, the harder it is pushed.
+
+Structurally this needed `Layer::backward` split in two, since softmax has no
+elementwise derivative to apply. `backward_from_pre_activation` takes `dL/dz`
+directly; everything after that point is identical for every activation.
+
+**Weight initialisation scale matters far more than it looks.** The original
+`uniform(-1, 1)` ignored layer width entirely. Switching to width-aware ranges
+— He `sqrt(6/fan_in)` for ReLU, Xavier `sqrt(6/(fan_in+fan_out))` otherwise —
+lifted even the *unchanged* sigmoid network from 95.4% to 97.8%. Bad init does
+not announce itself; it just quietly costs you two points.
+
+**Cross-entropy needs a much smaller learning rate** — 0.3 here versus 3.0 for
+squared error — precisely because its gradients are not shrunk by a `y(1-y)`
+factor.
 
 ## Gotchas paid for already
 
@@ -166,17 +222,19 @@ no such ordering.
 
 ## Possible next steps
 
-1. **ReLU + softmax + cross-entropy.** The biggest accuracy win available.
-   Fixes saturation, and is why nobody trains a classifier with MSE.
-   Cross-entropy's gradient through softmax simplifies beautifully to `(y - t)`
-   — cleaner than what we have now. Should reach ~97-98%. Now easy: activations
-   are isolated in `activation.rs` and applied elementwise to a matrix.
-2. **Fight the overfitting** seen above: L2 regularisation, dropout, or just
-   early stopping on a proper validation split carved out of the training set.
-3. **Go faster still.** Parallelise `matmul` across rows with threads; cut the
-   allocation churn (`backward` clones two matrices per layer per batch);
-   or block the matmul for cache reuse.
+1. **Fight the overfitting**, now the clearest bottleneck — training accuracy
+   is pinned at 100% while test sits at 98%. L2 regularisation, dropout, or
+   early stopping on a validation split carved out of the training data.
+2. **Momentum or Adam.** Plain SGD with a fixed learning rate is the last
+   genuinely old-fashioned piece left. Momentum is ~5 lines and usually worth
+   half a point; a learning-rate schedule would also stop the late-training
+   wobble.
+3. **Convolutions.** The architecture that actually suits images — weights
+   shared across positions, so a stroke detector learned in one corner works
+   everywhere. This is the step from ~98% to ~99.3%, and a big one.
+4. **Save and load trained weights.** Every run currently starts from scratch.
+5. **Go faster still.** Parallelise `matmul` across rows with threads; cut the
+   allocation churn (`backward` clones two matrices per layer per batch).
 
-Also unaddressed: momentum/Adam, learning-rate schedules, convolutions (the
-architecture that actually suits images), and saving/loading trained weights —
-every run currently starts from scratch.
+Also unaddressed: batch normalisation, data augmentation, and any principled
+hyperparameter search — the learning rates here were found by trying a few.

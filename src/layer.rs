@@ -17,7 +17,7 @@
 //! makes `X * W` work out, and it means the inner loop of `matmul` walks a
 //! contiguous row rather than striding down a column.
 
-use crate::activation::{sigmoid, sigmoid_derivative_from_output};
+use crate::activation::Activation;
 use crate::matrix::Matrix;
 use crate::rng::Rng;
 
@@ -27,6 +27,8 @@ pub struct Layer {
     pub weights: Matrix,
     /// One per neuron.
     pub biases: Vec<f64>,
+    /// Applied to this layer's pre-activations.
+    pub activation: Activation,
 }
 
 /// Gradients for one layer, shaped exactly like the layer itself.
@@ -53,7 +55,7 @@ impl LayerGradients {
 }
 
 impl Layer {
-    pub fn new(weights: Matrix, biases: Vec<f64>) -> Self {
+    pub fn new(weights: Matrix, biases: Vec<f64>, activation: Activation) -> Self {
         assert_eq!(
             weights.cols,
             biases.len(),
@@ -61,21 +63,38 @@ impl Layer {
             weights.cols,
             biases.len()
         );
-        Self { weights, biases }
+        Self {
+            weights,
+            biases,
+            activation,
+        }
     }
 
-    /// Random weights in [-1, 1).
+    /// Random weights, scaled to the layer's shape and activation.
     ///
-    /// Not zeros: identical neurons would receive identical gradients and stay
-    /// identical forever. Randomness is what lets them specialise.
-    pub fn random(n_inputs: usize, n_neurons: usize, rng: &mut Rng) -> Self {
+    /// The range comes from `Activation::init_limit` — He for ReLU, Xavier
+    /// otherwise — rather than a fixed [-1, 1). With 784 inputs a fixed range
+    /// produces pre-activations far too large, which saturates sigmoid and
+    /// makes ReLU explode.
+    ///
+    /// Weights must differ from each other or neurons would receive identical
+    /// gradients forever. Biases have no such problem — the weights already
+    /// break the symmetry — so they start at zero, which is standard.
+    pub fn random(
+        n_inputs: usize,
+        n_neurons: usize,
+        activation: Activation,
+        rng: &mut Rng,
+    ) -> Self {
+        let limit = activation.init_limit(n_inputs, n_neurons);
         let data = (0..n_inputs * n_neurons)
-            .map(|_| rng.uniform(-1.0, 1.0))
+            .map(|_| rng.uniform(-limit, limit))
             .collect();
 
         Self {
             weights: Matrix::from_vec(n_inputs, n_neurons, data),
-            biases: (0..n_neurons).map(|_| rng.uniform(-1.0, 1.0)).collect(),
+            biases: vec![0.0; n_neurons],
+            activation,
         }
     }
 
@@ -103,7 +122,7 @@ impl Layer {
 
         let mut out = inputs.matmul(&self.weights);
         out.add_row_broadcast(&self.biases);
-        out.map_in_place(sigmoid);
+        self.activation.apply(&mut out);
         out
     }
 
@@ -131,13 +150,32 @@ impl Layer {
         outputs: &Matrix,
         d_outputs: &Matrix,
     ) -> (LayerGradients, Matrix) {
-        // dZ = dA ⊙ sigmoid'(A)
+        // dZ = dA ⊙ activation'(A)
         let mut d_z = d_outputs.clone();
         let mut slopes = outputs.clone();
-        slopes.map_in_place(sigmoid_derivative_from_output);
+        slopes.map_in_place(|y| self.activation.derivative_from_output(y));
         d_z.multiply_elementwise(&slopes);
 
-        let d_weights = inputs.transpose().matmul(&d_z);
+        self.backward_from_pre_activation(inputs, &d_z)
+    }
+
+    /// The second half of `backward`, entered directly when the caller already
+    /// knows `dL/dz`.
+    ///
+    /// This split exists for softmax. Softmax's derivative is not elementwise
+    /// — every output depends on every input — so the `dA ⊙ activation'(A)`
+    /// step above simply does not apply to it. But paired with cross-entropy,
+    /// `dL/dz` collapses to `y - t`, which the network can compute directly
+    /// and hand straight to this method.
+    ///
+    /// Everything from here on is identical for every activation, because
+    /// once you have `dZ`, the activation no longer matters.
+    pub fn backward_from_pre_activation(
+        &self,
+        inputs: &Matrix,
+        d_z: &Matrix,
+    ) -> (LayerGradients, Matrix) {
+        let d_weights = inputs.transpose().matmul(d_z);
         let d_biases = d_z.column_sums();
         let d_inputs = d_z.matmul(&self.weights.transpose());
 
@@ -189,6 +227,7 @@ mod tests {
                 vec![0.3, 2.0],  // input 2 -> both neurons
             ]),
             vec![0.1, -0.6],
+            Activation::Sigmoid,
         );
 
         let batch = Matrix::from_rows(&[
@@ -214,7 +253,7 @@ mod tests {
     #[test]
     fn forward_produces_one_row_per_sample() {
         let mut rng = Rng::new(1);
-        let layer = Layer::random(4, 3, &mut rng);
+        let layer = Layer::random(4, 3, Activation::Sigmoid, &mut rng);
 
         let batch = Matrix::zeros(7, 4);
         let out = layer.forward(&batch);
@@ -228,7 +267,7 @@ mod tests {
     #[test]
     fn backward_shapes_line_up() {
         let mut rng = Rng::new(2);
-        let layer = Layer::random(5, 3, &mut rng);
+        let layer = Layer::random(5, 3, Activation::Sigmoid, &mut rng);
 
         // `vec![..; 4]` rather than `[..; 4]`: array repetition needs Copy,
         // and Vec is only Clone.
@@ -249,7 +288,7 @@ mod tests {
     #[should_panic(expected = "layer expects 4 inputs, got 3")]
     fn wrong_input_width_is_rejected() {
         let mut rng = Rng::new(3);
-        let layer = Layer::random(4, 2, &mut rng);
+        let layer = Layer::random(4, 2, Activation::Sigmoid, &mut rng);
         layer.forward(&Matrix::zeros(1, 3));
     }
 }
