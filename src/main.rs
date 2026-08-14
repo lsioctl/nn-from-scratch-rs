@@ -1,6 +1,5 @@
 // We build this project up one concept at a time, so some modules are fully
-// written and tested before `main` has any use for them. Without this, the
-// compiler nags about `Layer` and `Network` sitting idle during step 3a.
+// written and tested before `main` has any use for them.
 #![allow(dead_code)]
 
 mod layer;
@@ -9,68 +8,62 @@ mod network;
 mod neuron;
 mod rng;
 
-use neuron::Neuron;
+use network::Network;
 use rng::Rng;
 
-/// A dataset is a list of (inputs, target) pairs.
-type Samples = Vec<(Vec<f64>, f64)>;
+type Samples = Vec<(Vec<f64>, Vec<f64>)>;
 
-fn gate_samples(targets: [f64; 4]) -> Samples {
+fn xor_samples() -> Samples {
     vec![
-        (vec![0.0, 0.0], targets[0]),
-        (vec![0.0, 1.0], targets[1]),
-        (vec![1.0, 0.0], targets[2]),
-        (vec![1.0, 1.0], targets[3]),
+        (vec![0.0, 0.0], vec![0.0]),
+        (vec![0.0, 1.0], vec![1.0]),
+        (vec![1.0, 0.0], vec![1.0]),
+        (vec![1.0, 1.0], vec![0.0]),
     ]
 }
 
-/// Train one neuron on one dataset, printing the loss as it goes.
-fn train_and_report(name: &str, samples: &Samples, epochs: usize, learning_rate: f64) {
+fn main() {
+    let samples = xor_samples();
+
+    // 2 inputs -> 4 hidden -> 1 output. Every weight starts random; nothing
+    // in here knows what XOR is.
     let mut rng = Rng::new(42);
-    let mut neuron = Neuron::random(2, &mut rng);
+    let mut net = Network::random(&[2, 4, 1], &mut rng);
 
-    println!("=== learning {name} ===");
-    println!(
-        "  start:  w = [{:+.3}, {:+.3}]  b = {:+.3}   (random)",
-        neuron.weights[0], neuron.weights[1], neuron.bias
-    );
-    println!("\n   epoch  |     loss");
-    println!("  --------+-----------");
+    println!("Learning XOR by backpropagation  (2 -> 4 -> 1, random init)\n");
+    println!("   epoch  |     loss   |  predictions for 00  01  10  11");
+    println!("  --------+------------+---------------------------------");
 
+    let epochs = 20_000;
     for epoch in 0..=epochs {
-        let loss = neuron.train_epoch(samples, learning_rate);
-        if epoch % (epochs / 8) == 0 {
-            println!("  {epoch:>7}  |  {loss:.5}");
+        let loss = net.train_epoch(&samples, 5.0);
+
+        if epoch % 2_500 == 0 {
+            let p: Vec<String> = samples
+                .iter()
+                .map(|(inputs, _)| format!("{:.2}", net.forward(inputs)[0]))
+                .collect();
+            println!("  {epoch:>7}  |  {loss:.6}  |     {}", p.join("  "));
         }
     }
 
-    println!(
-        "\n  learned:  w = [{:+.3}, {:+.3}]  b = {:+.3}",
-        neuron.weights[0], neuron.weights[1], neuron.bias
-    );
-    println!("\n   x1   x2  |  predicted   target");
-    println!("  ----------+--------------------");
-    for (inputs, target) in samples {
+    println!("\n  targets were:                    0.00  1.00  1.00  0.00\n");
+
+    // What did the hidden layer invent for itself?
+    println!("What the 4 hidden neurons learned to compute:\n");
+    println!("   x1   x2  |    h0     h1     h2     h3  |  output   want");
+    println!("  ----------+------------------------------+---------------");
+    for (inputs, targets) in &samples {
+        let acts = net.forward_all(inputs);
+        let h = &acts[1];
         println!(
-            "  {:>4.0} {:>4.0}  |     {:.4}      {target:.0}",
-            inputs[0],
-            inputs[1],
-            neuron.forward(inputs)
+            "  {:>4.0} {:>4.0}  | {:>5.2}  {:>5.2}  {:>5.2}  {:>5.2}  |  {:.4}   {:.0}",
+            inputs[0], inputs[1], h[0], h[1], h[2], h[3], acts[2][0], targets[0]
         );
     }
-    println!();
-}
 
-fn main() {
-    // Nobody tells the neuron what AND means. It only ever sees four
-    // (input, target) pairs and a rule for going downhill.
-    train_and_report("AND", &gate_samples([0.0, 0.0, 0.0, 1.0]), 20_000, 5.0);
-
-    // Same code, same effort, one line of data changed — and it collapses.
-    train_and_report("XOR", &gate_samples([0.0, 1.0, 1.0, 0.0]), 20_000, 5.0);
-
-    println!("Notice how XOR fails: no error, no divergence. The loss just");
-    println!("parks at 0.25 and the neuron answers 0.5 to everything — the");
-    println!("arithmetic of a machine that has given up and is hedging.");
-    println!("0.25 is exactly the loss of guessing 0.5 on all four examples.");
+    println!("\nCompare with step 2, where I hand-picked an OR and an AND from");
+    println!("boolean algebra. Backprop found its own internal representation —");
+    println!("probably not OR/AND, and it does not need to be. Any hidden layer");
+    println!("that makes the four cases linearly separable will do.");
 }

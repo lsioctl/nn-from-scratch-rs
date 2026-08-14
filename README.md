@@ -55,3 +55,72 @@ predictions:  0.5, 0.5, 0.5, 0.5
 It didn't error. It didn't diverge. It drove its own weights to exactly zero and now answers 0.5 to everything — 0.25 is precisely the loss of hedging on all four examples. The gradients from the two →1 cases and the two →0 cases cancel perfectly, and it settles into paralysis.
 
 This is step 1's geometric claim, arrived at empirically. It's also what real training failure looks like: not a crash, just a loss curve that flatlines somewhere useless.
+
+recap: You're building a neural network from scratch in Rust, step by step. A single neuron now learns AND on its own via gradient descent, but stalls on XOR. Next up is step 3b: backpropagation through layers, then retraining XOR. (disable recaps in /config)
+
+Step 3b: backpropagation. The problem to solve — a hidden neuron has no target. Nobody can say what the OR neuron "should" have output.
+
+XOR learned from random weights. Loss 0.32 → 0.000024. Clean build, 24 tests pass.
+
+The one idea
+
+A hidden neuron has no target — that was the blocker. Backprop sidesteps it entirely. It never asks "what should this neuron have output?" It asks:
+
+▎ If this neuron's output had been slightly larger, would the loss have gone up or down?
+
+That question needs no target, only the chain rule. And the answer for a hidden neuron is assembled from the neurons it feeds: blame flows back through the same weights the signal came forward through, in proportion to their size. A neuron connected by a big weight caused more of the error, so it gets more of the blame.
+
+The shape that makes it work
+
+Layer::backward is the whole trick, and it's in the signature:
+
+forward:    inputs        ──>  outputs
+backward:   dL/d(outputs) ──>  dL/d(inputs)
+
+A layer is handed "how much the loss cares about each of my outputs" and returns "how much the loss cares about each of my inputs." Since its inputs are the previous layer's outputs, the return value is exactly what the previous layer needs as its input. Chain them and the signal walks to the front on its own.
+
+Network::gradients (src/network.rs:110) is then almost anticlimactic:
+
+let mut dl_doutputs = /* 2(y - t) — the ONLY place a target is used */;
+
+for (k, layer) in self.layers.iter().enumerate().rev() {
+    let (layer_gradients, dl_dinputs) =
+        layer.backward(&activations[k], &activations[k + 1], &dl_doutputs);
+    gradients.push(layer_gradients);
+    dl_doutputs = dl_dinputs;   // hand it to the layer behind
+}
+
+Three lines of loop. That's backpropagation.
+
+Per neuron it's the same delta from step 3a — delta = dL/dout × sigmoid'(out) — used twice: once for its own gradients (delta × input), once to send backwards (delta × weight). Nothing new was invented for the multi-layer case.
+
+The gradient check earned its keep
+
+It failed on the first run:
+
+layer 0 neuron 0 weight 0: analytic -0.02697 vs numerical -0.01348
+
+Exactly 2×, on a network with 2 outputs. I was averaging the per-sample loss over outputs while seeding the gradient with an unaveraged 2(y-t). Every gradient was off by a constant factor.
+
+Worth dwelling on: that bug would still have trained. A uniformly scaled gradient just acts like a different learning rate — XOR (1 output) passed fine. It would have surfaced later as "why does this need a weird learning rate," on a bigger network, with no clue where to look. Numerical gradient checking is how you avoid losing a day to that.
+
+I fixed it by summing over outputs rather than averaging, which keeps dL/dyⱼ = 2(yⱼ - tⱼ) exact with no bookkeeping.
+
+What it invented
+
+   x1   x2  |    h0     h1     h2     h3
+     0    0  |  0.28   0.89   0.61   0.05
+     0    1  |  0.26   0.04   0.02   0.00
+     1    0  |  0.70   1.00   0.05   0.96
+     1    1  |  0.68   0.98   0.00   0.01
+
+Not OR and AND. h2 fires only for (0,0), h3 only for (1,0), h0 roughly tracks x1. It's a representation I wouldn't have designed and can only partly read — and it works as well as my hand-derived one.
+
+That's the real lesson of step 3. Backprop doesn't find your solution; it finds one of the many that work. Any hidden layer making the four cases linearly separable is acceptable, and gradient descent has no reason to prefer the interpretable one. At scale this is why network internals resist explanation.
+
+---
+The core is done: you have a working neural network, from scratch, no dependencies. Natural next steps, roughly in order of payoff:
+
+- Real data (MNIST digits) — where you meet minibatching, train/test splits, and overfitting. The biggest step up in realism.
+- Better activations (ReLU) and softmax + cross-entropy — fixes the saturation problem you saw in sigmoid_derivative, and the reason nobody trains classifiers with MSE.
+- Refactor to matrices — collapse the per-neuron loops into matrix ops; faster, and closer to how real frameworks are written.

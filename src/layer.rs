@@ -13,11 +13,59 @@
 //! outputs come out — and note that those two numbers need not match. A layer
 //! is free to change the width of the data flowing through it.
 
-use crate::neuron::Neuron;
+use crate::neuron::{Neuron, sigmoid_derivative_from_output};
 
 #[derive(Debug, Clone)]
 pub struct Layer {
     pub neurons: Vec<Neuron>,
+}
+
+/// The gradients for one layer: one gradient per weight, one per bias.
+///
+/// Same shape as the layer itself — `weights[j][i]` is the gradient for the
+/// i-th weight of the j-th neuron.
+#[derive(Debug, Clone)]
+pub struct LayerGradients {
+    pub weights: Vec<Vec<f64>>,
+    pub biases: Vec<f64>,
+}
+
+impl LayerGradients {
+    /// An all-zero set of gradients shaped like `layer`, ready to accumulate.
+    pub fn zeros_like(layer: &Layer) -> Self {
+        Self {
+            weights: layer
+                .neurons
+                .iter()
+                .map(|n| vec![0.0; n.weights.len()])
+                .collect(),
+            biases: vec![0.0; layer.neurons.len()],
+        }
+    }
+
+    /// Add another sample's gradients into this accumulator.
+    pub fn add(&mut self, other: &LayerGradients) {
+        for (row, other_row) in self.weights.iter_mut().zip(&other.weights) {
+            for (g, o) in row.iter_mut().zip(other_row) {
+                *g += o;
+            }
+        }
+        for (b, o) in self.biases.iter_mut().zip(&other.biases) {
+            *b += o;
+        }
+    }
+
+    /// Divide through by the batch size to get an average.
+    pub fn scale(&mut self, factor: f64) {
+        for row in &mut self.weights {
+            for g in row {
+                *g *= factor;
+            }
+        }
+        for b in &mut self.biases {
+            *b *= factor;
+        }
+    }
 }
 
 impl Layer {
@@ -52,6 +100,81 @@ impl Layer {
     /// `forward`, gather the results into a `Vec`.
     pub fn forward(&self, inputs: &[f64]) -> Vec<f64> {
         self.neurons.iter().map(|n| n.forward(inputs)).collect()
+    }
+
+    /// The backward pass: gradients for this layer, plus the error signal to
+    /// hand to the layer behind it.
+    ///
+    /// The signature is the important idea. Every layer speaks the same
+    /// language in both directions:
+    ///
+    ///   forward:   inputs           ──>  outputs
+    ///   backward:  dL/d(outputs)    ──>  dL/d(inputs)
+    ///
+    /// A layer is handed "how much the loss cares about each of my outputs",
+    /// and returns "how much the loss cares about each of my inputs". Since
+    /// its inputs *are* the previous layer's outputs, that return value is
+    /// exactly what the previous layer needs. Chain the layers and the signal
+    /// walks all the way back to the front. That is backpropagation.
+    ///
+    /// Three things happen per neuron:
+    ///
+    ///   1. delta = dL/dout * sigmoid'(out)     -- push through the activation
+    ///   2. weight gradient = delta * input     -- blame each weight in
+    ///      bias gradient   = delta                proportion to what it saw
+    ///   3. send delta * weight backwards       -- blame each input in
+    ///                                             proportion to its weight
+    ///
+    /// Step 3 is the answer to "what should the hidden neuron have output?"
+    /// We never find out. Instead we ask: *if* this input had been slightly
+    /// larger, would the loss have gone up or down? A hidden neuron connected
+    /// through a large weight gets a large share of the blame. It is a
+    /// responsibility calculation, and it needs no target.
+    pub fn backward(
+        &self,
+        inputs: &[f64],
+        outputs: &[f64],
+        dl_doutputs: &[f64],
+    ) -> (LayerGradients, Vec<f64>) {
+        let mut gradients = LayerGradients::zeros_like(self);
+
+        // What we will hand back to the previous layer. Every neuron in this
+        // layer contributes to every one of these, so we sum into it.
+        let mut dl_dinputs = vec![0.0; self.n_inputs()];
+
+        for (j, neuron) in self.neurons.iter().enumerate() {
+            // 1. Convert "gradient w.r.t. my output" into "gradient w.r.t. my
+            //    pre-activation z" by passing through the sigmoid's slope.
+            //    This is the same `delta` from step 3a.
+            let delta = dl_doutputs[j] * sigmoid_derivative_from_output(outputs[j]);
+
+            // 2. This layer's own gradients — identical to the single-neuron
+            //    case, because once you have delta, nothing else differs.
+            for (i, g) in gradients.weights[j].iter_mut().enumerate() {
+                *g = delta * inputs[i];
+            }
+            gradients.biases[j] = delta;
+
+            // 3. Propagate. Input i influenced this neuron through weight i,
+            //    so it receives delta * weight_i of the blame — accumulated
+            //    across every neuron this input fed into.
+            for (i, w) in neuron.weights.iter().enumerate() {
+                dl_dinputs[i] += delta * w;
+            }
+        }
+
+        (gradients, dl_dinputs)
+    }
+
+    /// Step every weight and bias downhill.
+    pub fn apply_gradients(&mut self, gradients: &LayerGradients, learning_rate: f64) {
+        for (neuron, (weight_grads, bias_grad)) in self
+            .neurons
+            .iter_mut()
+            .zip(gradients.weights.iter().zip(&gradients.biases))
+        {
+            neuron.apply_gradients(weight_grads, *bias_grad, learning_rate);
+        }
     }
 }
 
